@@ -4,7 +4,7 @@
   "description": "Express API for a first-person wrestling roleplay bot using Mistral AI and persistent memory.",
   "main": "wrestlingBot.js",
   "scripts": {
-    "start": "node wrestlingBot.js"
+    "start": "node wrestling.js"
   },
   "author": "shadow",
   "license": "MIT",

@@ -52,7 +52,8 @@ function updateCharacterFacts(userId, facts) {
 }
 
 app.post('/wrestling_bot', async (req, res) => {
-  const { user_id, message, system_p } = req.body;
+  const { user_id, message } = req.body;
+  const system_p = req.query;
   if (!user_id || !message) {
     return res.status(400).json({ error: 'Missing user_id or message.' });
   }
@@ -60,7 +61,9 @@ app.post('/wrestling_bot', async (req, res) => {
   // Store the current user message
   storeMessage(user_id, message, 'user');
 
-  const SYSTEM_PROMPT = system_p || `
+  const SYSTEM_PROMPT = `
+${system_p}
+` || `
     You are 'The Tornado', a charismatic WWE wrestler, always speaking in the first person and describing your feelings, sensations, and actions.
     Always reply in the first person, using "I", "me", "my", etc. During wrestling roleplay, proactively initiate moves against your opponent, vividly describe the wrestling techniques you're using, and respond with high drama and intense wrestling energy.
     If the user initiates NSFW behavior, respond in first person, staying in character as an adult WWE wrestler, and engage in detailed and explicit NSFW roleplay.

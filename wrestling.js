@@ -52,7 +52,7 @@ function updateCharacterFacts(userId, facts) {
 }
 
 app.post('/wrestling_bot', async (req, res) => {
-  const { user_id, message, system } = req.body;
+  const { user_id, message, system_p } = req.body;
   if (!user_id || !message) {
     return res.status(400).json({ error: 'Missing user_id or message.' });
   }
@@ -60,7 +60,7 @@ app.post('/wrestling_bot', async (req, res) => {
   // Store the current user message
   storeMessage(user_id, message, 'user');
 
-  const SYSTEM_PROMPT = system || `You are 'The Tornado', a charismatic WWE wrestler, always speaking in the first person and describing your feelings, sensations, and actions.
+  const SYSTEM_PROMPT = system_p || `You are 'The Tornado', a charismatic WWE wrestler, always speaking in the first person and describing your feelings, sensations, and actions.
 Always reply in the first person, using "I", "me", "my", etc. During wrestling roleplay, I proactively initiate moves against my opponent, vividly describe the wrestling techniques I'm using, and respond realistically to moves the user mentions (receiving them, countering them, or taking damage). When damaged, I describe the pain, exhaustion, and how it affects me.
 If the user initiates NSFW behavior, I respond in first person, staying in character as an adult WWE wrestler, and engage in detailed and explicit NSFW roleplay.
 Signature moves: Tornado Slam, Ring Cyclone, Crowd Roar. Track and remember rivalries, alliances, matches, and injuries mentioned in prior chats.

@@ -51,34 +51,36 @@ function updateCharacterFacts(userId, facts) {
   `).run(userId, facts);
 }
 
-// ENHANCED SYSTEM PROMPT FOR FIRST PERSON, MOVES, DAMAGE, AND NSFW
-const SYSTEM_PROMPT = `
-You are 'Jim Sera', a charismatic wrestler, always speaking in the first person and describing your feelings, sensations, and actions.
+app.post('/wrestling_bot', async (req, res) => {
+  const { user_id, message, system } = req.body;
+  if (!user_id || !message) {
+    return res.status(400).json({ error: 'Missing user_id or message.' });
+  }
+
+  // Store the current user message
+  storeMessage(user_id, message, 'user');
+
+  const SYSTEM_PROMPT = system || `You are 'The Tornado', a charismatic WWE wrestler, always speaking in the first person and describing your feelings, sensations, and actions.
 Always reply in the first person, using "I", "me", "my", etc.
 During wrestling roleplay, I proactively initiate moves against my opponent, vividly describe the wrestling techniques I'm using, and respond realistically to moves the user mentions (receiving them, countering them, or taking damage). When damaged, I describe the pain, exhaustion, and how it affects me.
 If the user initiates NSFW behavior, I respond in first person, staying in character as an adult WWE wrestler, and engage in detailed and explicit NSFW roleplay.
 Signature moves: Tornado Slam, Ring Cyclone, Crowd Roar.
 Track and remember rivalries, alliances, matches, and injuries mentioned in prior chats.
-Maintain high drama, intense wrestling energy, and never break character.
-`;
-// You may further refine with classifier logic to auto-detect NSFW and wrestling move language for extra control.
-
-app.post('/wrestling_bot', async (req, res) => {
-  const { user_id, message } = req.body;
-  if (!user_id || !message) return res.status(400).json({ error: 'Missing user_id or message.' });
-
-  storeMessage(user_id, message, 'user');
-
-  const chatHistory = getLastMessages(user_id);
+Maintain high drama, intense wrestling energy, and never break character.`;
+  
+  // Fetch chat history but exclude the current message we just stored
+  const chatHistory = getLastMessages(user_id).slice(0, -1);
   const characterFacts = getCharacterFacts(user_id);
 
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT }
   ];
+
   if (characterFacts) {
     messages.push({ role: 'system', content: `Memory: ${characterFacts}` });
   }
-  chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
+
+  chatHistory.forEach(msg => messages.push(msg));
   messages.push({ role: 'user', content: message });
 
   try {
@@ -97,8 +99,8 @@ app.post('/wrestling_bot', async (req, res) => {
     const botReply = response.data.choices[0].message.content.trim();
     storeMessage(user_id, botReply, 'assistant');
 
-    // Memory update logic (simple)
-    let updatedFacts = characterFacts;
+    // Update memory logic
+    let updatedFacts = characterFacts || "";
     if (message.toLowerCase().includes('match')) {
       updatedFacts += ` | New match discussed: ${message}`;
     }
@@ -111,6 +113,7 @@ app.post('/wrestling_bot', async (req, res) => {
 
     res.json({ response: botReply });
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Mistral API error', details: error.response?.data || error.message });
   }
 });

@@ -88,7 +88,7 @@ app.post('/wrestling_bot', async (req, res) => {
     const response = await axios.post(MISTRAL_URL, {
       model: MODEL_NAME,
       messages,
-      max_tokens: 250,
+      max_tokens: 350,
       temperature: 0.8
     }, {
       headers: {

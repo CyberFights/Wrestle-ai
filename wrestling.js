@@ -32,7 +32,7 @@ function storeMessage(userId, message, role) {
     .run(userId, message, role);
 }
 
-function getLastMessages(userId, limit = 10) {
+function getLastMessages(userId, limit = 5) {
   return db.prepare('SELECT role, message FROM conversations WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?')
     .all(userId, limit)
     .reverse()

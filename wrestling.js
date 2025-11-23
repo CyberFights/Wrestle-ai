@@ -69,7 +69,7 @@ app.post('/wrestling_bot', async (req, res) => {
     Maintain high drama, intense wrestling energy, and never break character.`;
 
   // Fetch chat history but exclude the current message we just stored
-  const chatHistory = getLastMessages(user_id).slice(0, -1);
+  const chatHistory = getLastMessages(user_id, 5).slice(0, -1);
   const characterFacts = getCharacterFacts(user_id);
 
   const messages = [

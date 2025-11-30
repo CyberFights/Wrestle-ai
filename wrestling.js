@@ -119,5 +119,7 @@ app.post('/wrestling_bot', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", () => console.log(`Wrestling bot API running on port ${PORT}`));
+const port = process.env.PORT || 8080;
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Wrestling bot API running on port ${PORT}`);
+});

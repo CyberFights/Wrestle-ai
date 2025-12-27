@@ -50,8 +50,8 @@ function updateCharacterFacts(userId, facts) {
     ON CONFLICT(user_id) DO UPDATE SET character_facts = excluded.character_facts
   `).run(userId, facts);
 }
-app.get('/', () => {
-  send.json({ "error": "this is a private Ai interface not meant for public use, without the correct key you cannot use it, your ipaddress has been logged" });
+app.get('/', (res) => {
+  return res.status(500).json({ error: 'this is a private Ai interface not meant for public use, without the correct key you cannot use it, your ipaddress has been logged' });
 });
 
 app.post('/wrestling_bot', async (req, res) => {

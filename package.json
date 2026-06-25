@@ -1,18 +1,20 @@
- {
-  "name": "wrestling-roleplay-bot",
+{
+  "name": "wrestling-bot",
   "version": "1.0.0",
-  "description": "Express API for a first-person wrestling roleplay bot using Mistral AI and persistent memory.",
-  "main": "wrestlingBot.js",
+  "description": "Custom Mistral-powered wrestling roleplay AI server",
+  "main": "wrestling.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node wrestling.js"
   },
-  "author": "shadow",
-  "license": "MIT",
   "dependencies": {
+    "@mistralai/tokenizers": "^0.4.0",
     "axios": "^1.6.7",
     "better-sqlite3": "^9.0.0",
     "body-parser": "^1.20.2",
     "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
- 

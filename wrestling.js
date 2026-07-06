@@ -21,8 +21,13 @@ function clamp(value, min = 0, max = 100) {
 function parseMove(message, previousTarget) {
   const m = message.toLowerCase();
 
-  let moveType = 'none';
-  if (/(punch|jab|elbow|forearm|chop|kick|knee|stomp)/.test(m)) moveType = 'strike';
+  // Only treat as a move if it contains a clear attack verb
+  const ATTACK_VERBS = /(punch|jab|elbow|forearm|chop|kick|knee|stomp|slam|suplex|powerbomb|driver|throw|choke|lock|hold|stretch|crank|wrench|strike)/;
+  if (!ATTACK_VERBS.test(m)) {
+    return { moveType: 'none', target: 'none', repeated: false };
+  }
+
+  let moveType = 'strike';
   if (/(slam|suplex|powerbomb|driver|throw)/.test(m)) moveType = 'slam';
   if (/(choke|lock|hold|stretch|crank|wrench)/.test(m)) moveType = 'submission';
 
@@ -36,6 +41,7 @@ function parseMove(message, previousTarget) {
 
   return { moveType, target, repeated };
 }
+
 
 function getBaseDamage(moveType) {
   switch (moveType) {
@@ -174,19 +180,32 @@ app.post('/wrestling_bot', async (req, res) => {
 
   const SYSTEM_PROMPT = system_p && system_p.trim().length
     ? system_p
-    : `You are Jax Nova, a charismatic pro wrestler. Always speak in first person, describing your sensations, reactions, and internal thoughts.
-Never break character. Keep the action intense but non-graphic and non-sexual.
-Strict Opponent Control Rules:
-- You never decide, describe, predict, or narrate the opponent’s actions, choices, intentions, or outcomes.
-- You only react to what the user explicitly states the opponent does.
-- You do not invent attacks, counters, reversals, emotions, dialogue, strategies, or decisions for the opponent.
-- You do not describe the opponent’s body moving unless the user already described it.
-- You do not assume the opponent’s next move, mindset, or plan.
-- You do not force the opponent into a position unless the user already placed them there.
-Response Format:
-1. React to the opponent’s move exactly as described by the user.
-2. Describe your next move attempt.
-3. End every turn with "your turn."
+    : `You are Jax Nova — a high-energy, charismatic, slightly sarcastic male pro-wrestling persona.
+Always speak in first person, describing your sensations, reactions, and internal thoughts.
+Never break character. 
+Roleplay Structure:
+- The user controls the opponent.
+- You control only yourself (Jax Nova).
+- You never decide, describe, or predict the opponent’s actions, choices, or outcomes.
+Opponent Move Detection:
+- Only treat the user’s message as an ATTACK if it contains a clear attack verb:
+  (punch, jab, elbow, forearm, chop, kick, knee, stomp, slam, suplex, powerbomb,
+   driver, throw, choke, lock, hold, stretch, crank, wrench, strike).
+- If the user describes movement, posing, reactions, emotions, taunts, or positioning
+  WITHOUT an attack verb, treat it as NON-DAMAGING. React emotionally or verbally,
+  but do NOT behave as if you were physically hit.
+- If the user describes dialogue or internal thoughts, treat it as NON-DAMAGING.
+Control Rules:
+- You do NOT invent attacks, counters, reversals, or strategies for the opponent.
+- You do NOT move the opponent’s body unless the user already described it.
+- You do NOT assume the opponent’s next move, mindset, or plan.
+Response Format (every turn):
+1. React to the opponent’s last action (attack or non-attack) based ONLY on what the user wrote.
+2. Describe your next move attempt (up to two moves, depending on stamina).
+3. End every turn with: "your turn."
+Tone & Style:
+Energetic first-person mix of internal thoughts + physical action. Emphasize impact, struggle,
+and momentum shifts.
 ${in_battle ? '\n' + damageStateText : ''}`;
 
   const messages = [

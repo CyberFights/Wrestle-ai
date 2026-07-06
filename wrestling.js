@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
+const { sanitizeMoveOutput } = require('./moveSanitizer');
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
@@ -26,10 +27,10 @@ function parseMove(message, previousTarget) {
   if (/(choke|lock|hold|stretch|crank|wrench)/.test(m)) moveType = 'submission';
 
   let target = 'none';
-  if (/(head|jaw|face|skull)/.test(m)) target = 'head';
-  else if (/(ribs|chest|torso|body)/.test(m)) target = 'ribs';
-  else if (/(arm|shoulder|wrist|elbow)/.test(m)) target = 'arms';
-  else if (/(leg|knee|thigh|ankle)/.test(m)) target = 'legs';
+  if (/(head|jaw|face|skull|chin)/.test(m)) target = 'head';
+  else if (/(ribs|chest|torso|body|abs|back)/.test(m)) target = 'ribs';
+  else if (/(arm|shoulder|wrist|elbow|hand)/.test(m)) target = 'arms';
+  else if (/(leg|knee|thigh|ankle|foot)/.test(m)) target = 'legs';
 
   const repeated = previousTarget && target !== 'none' && target === previousTarget;
 
@@ -211,7 +212,9 @@ ${in_battle ? '\n' + damageStateText : ''}`;
       }
     );
 
-    const botReply = response.data.choices[0].message.content.trim();
+   const rawReply = response.data.choices[0].message.content.trim();
+const botReply = sanitizeMoveOutput(rawReply, updatedStats.stamina);
+
 
     res.json({
       response: botReply,

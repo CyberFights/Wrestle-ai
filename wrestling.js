@@ -9,8 +9,48 @@ if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
 const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions';
 const MODEL_NAME = 'mistral-large-latest';
 
+const DB_FILE = 'wrestling_bot.db';
+const db = new Database(DB_FILE);
+
 const app = express();
 app.use(bodyParser.json());
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS conversations (
+    user_id TEXT,
+    message TEXT,
+    role TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS memory (
+    user_id TEXT PRIMARY KEY,
+    character_facts TEXT
+  );
+`);
+
+function storeMessage(userId, message, role) {
+  db.prepare('INSERT INTO conversations (user_id, message, role) VALUES (?, ?, ?)')
+    .run(userId, message, role);
+}
+
+function getLastMessages(userId, limit = 10) {
+  return db.prepare('SELECT role, message FROM conversations WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?')
+    .all(userId, limit)
+    .reverse()
+    .map(row => ({ role: row.role, content: row.message }));
+}
+
+function getCharacterFacts(userId) {
+  const row = db.prepare('SELECT character_facts FROM memory WHERE user_id = ?').get(userId);
+  return row ? row.character_facts : '';
+}
+
+function updateCharacterFacts(userId, facts) {
+  db.prepare(`
+    INSERT INTO memory (user_id, character_facts) VALUES (?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET character_facts = excluded.character_facts
+  `).run(userId, facts);
+}
 
 // ---------- DAMAGE ENGINE HELPERS ----------
 

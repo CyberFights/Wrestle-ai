@@ -2,6 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
+const Database = require('better-sqlite3');
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');

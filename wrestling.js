@@ -294,9 +294,10 @@ const botReply = sanitizeMoveOutput(rawReply, updatedStats.stamina);
 });
 
 app.post('/wrestling_chat', async (req, res) => {
-  const { user_id, message } = req.body;
+  const { user_id, message, system_p } = req.body;
   if (!user_id || !message) return res.status(400).json({ error: 'Missing user_id or message.' });
-
+ const system_p = system_p
+  const SYSTEM_PROMPT = system_p && system_p.trim().length
   storeMessage(user_id, message, 'user');
 
   const chatHistory = getLastMessages(user_id);

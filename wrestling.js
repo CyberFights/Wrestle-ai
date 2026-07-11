@@ -252,6 +252,58 @@ const botReply = sanitizeMoveOutput(rawReply, updatedStats.stamina);
   }
 });
 
+app.post('/wrestling_chat', async (req, res) => {
+  const { user_id, message } = req.body;
+  if (!user_id || !message) return res.status(400).json({ error: 'Missing user_id or message.' });
+
+  storeMessage(user_id, message, 'user');
+
+  const chatHistory = getLastMessages(user_id);
+  const characterFacts = getCharacterFacts(user_id);
+
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT }
+  ];
+  if (characterFacts) {
+    messages.push({ role: 'system', content: `Memory: ${characterFacts}` });
+  }
+  chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
+  messages.push({ role: 'user', content: message });
+
+  try {
+    const response = await axios.post(MISTRAL_URL, {
+      model: MODEL_NAME,
+      messages,
+      max_tokens: 250,
+      temperature: 0.8
+    }, {
+      headers: {
+        'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const botReply = response.data.choices[0].message.content.trim();
+    storeMessage(user_id, botReply, 'assistant');
+
+    // Memory update logic (simple)
+    let updatedFacts = characterFacts;
+    if (message.toLowerCase().includes('match')) {
+      updatedFacts += ` | New match discussed: ${message}`;
+    }
+    if (message.toLowerCase().match(/slam|cyclone|roar|injur|pain|nsfw|sex|fuck|kiss|touch/)) {
+      updatedFacts += ` | Notable event: ${message}`;
+    }
+    if (updatedFacts && updatedFacts !== characterFacts) {
+      updateCharacterFacts(user_id, updatedFacts);
+    }
+
+    res.json({ response: botReply });
+  } catch (error) {
+    res.status(500).json({ error: 'Mistral API error', details: error.response?.data || error.message });
+  }
+});
+
 const port = process.env.PORT || 8080;
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`Wrestling bot API running on port ${port}`);

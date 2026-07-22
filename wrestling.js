@@ -249,34 +249,60 @@ Energetic first-person mix of internal thoughts + physical action. Emphasize imp
 and momentum shifts.
 ${in_battle ? '\n' + damageStateText : ''}`;
 
-  const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: message }
-  ];
+  // Store user message immediately (same as wrestling_chat)
+storeMessage(user_id, message, 'user');
 
-  try {
-    const response = await axios.post(
-      MISTRAL_URL,
-      {
-        model: MODEL_NAME,
-        messages,
-        max_tokens: 260,
-        temperature: 0.8
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${MISTRAL_API_KEY}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json'
-        }
-      }
-    );
+// Load conversation history + memory
+const chatHistory = getLastMessages(user_id);
+const characterFacts = getCharacterFacts(user_id);
 
-   const rawReply = response.data.choices[0].message.content.trim();
+const messages = [
+  { role: 'system', content: SYSTEM_PROMPT }
+];
+
+if (characterFacts) {
+  messages.push({ role: 'system', content: `Memory: ${characterFacts}` });
+}
+
+chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
+messages.push({ role: 'user', content: message });
+
+const response = await axios.post(
+  MISTRAL_URL,
+  {
+    model: MODEL_NAME,
+    messages,
+    max_tokens: 250,
+    temperature: 0.8
+  },
+  {
+    headers: {
+      Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      'Content-Type': 'application/json'
+    }
+  }
+);
+
+const rawReply = response.data.choices[0].message.content.trim();
 const botReply = sanitizeMoveOutput(rawReply, updatedStats.stamina);
 
+// Store assistant reply
+storeMessage(user_id, botReply, 'assistant');
+    
+    let updatedFacts = characterFacts;
 
-    res.json({
+if (message.toLowerCase().includes('match')) {
+  updatedFacts += ` | New match discussed: ${message}`;
+}
+
+if (message.toLowerCase().match(/slam|cyclone|roar|injur|pain|nsfw|sex|fuck|kiss|touch/)) {
+  updatedFacts += ` | Notable event: ${message}`;
+}
+
+if (updatedFacts && updatedFacts !== characterFacts) {
+  updateCharacterFacts(user_id, updatedFacts);
+}
+  res.json({
       response: botReply,
       updated_stats: updatedStats,
       meta: {

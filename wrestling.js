@@ -302,21 +302,23 @@ if (message.toLowerCase().match(/slam|cyclone|roar|injur|pain|nsfw|sex|fuck|kiss
 if (updatedFacts && updatedFacts !== characterFacts) {
   updateCharacterFacts(user_id, updatedFacts);
 }
-  res.json({
-      response: botReply,
-      updated_stats: updatedStats,
-      meta: {
-        target: newTarget,
-        repeated_count: newRepeatedCount
-      }
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: 'Mistral API error',
-      details: error.response?.data || error.message
-    });
+
+res.json({
+  response: botReply,
+  updated_stats: updatedStats,
+  meta: {
+    target: newTarget,
+    repeated_count: newRepeatedCount
   }
+});
+
+} catch (error) {
+  console.error(error);
+  res.status(500).json({
+    error: 'Mistral API error',
+    details: error.response?.data || error.message
+  });
+}
 });
 
 app.post('/wrestling_chat', async (req, res) => {

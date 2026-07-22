@@ -266,7 +266,7 @@ if (characterFacts) {
 
 chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
 messages.push({ role: 'user', content: message });
-
+try {
 const response = await axios.post(
   MISTRAL_URL,
   {

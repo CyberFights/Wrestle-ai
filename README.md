@@ -2,38 +2,71 @@
 
 Custom Mistral-powered wrestling roleplay AI server.
 
-Uses a **MySQL** database (via `mysql2`) — designed to run on [Railway](https://railway.app) with its MySQL plugin.
+Uses a **MongoDB** database (via the official `mongodb` driver) — designed to run on
+[Railway](https://railway.app) with its MongoDB database.
 
 ## Environment variables
 
-- `MYSQL_URL` — MySQL connection string, e.g. `mysql://user:password@host:3306/railway`.
-  Railway sets this automatically when a MySQL plugin is attached. `DATABASE_URL` is accepted as a fallback.
+- `MONGO_URL` — MongoDB connection string, e.g. `mongodb://mongo:password@host:27017`.
+  Railway sets this automatically when a MongoDB database is attached.
+  `MONGODB_URI`, `MONGO_PUBLIC_URL` and `DATABASE_URL` are accepted as fallbacks.
 - `MISTRAL_API_KEY` — Mistral AI API key.
 - `PORT` — port to listen on (default `8080`).
 
-On startup the server creates the `conversations` and `memory` tables automatically.
+Optional:
 
-## Migrating your old SQLite history
+- `MONGO_DB_NAME` — database to use (default: the one in `MONGO_URL`, otherwise `wrestling_bot`).
+- `MONGO_MEMORY_COLLECTION` — collection holding the memory files (default `memory`).
+- `MEMORY_CHAT_LIMIT` — how many chats each memory file keeps (default `2000`).
+- `MEMORY_FACT_LIMIT` — how many matches / key facts each memory file keeps (default `500`).
 
-If you used the old SQLite version of this bot (`wrestling_bot.db`), you can copy its
-history into the MySQL database with the included migration script:
+## How memory is stored
 
-1. Make sure your old `wrestling_bot.db` is on the machine you're running the command from.
-2. Get your Railway MySQL URL — on the Railway dashboard, open your service →
-   **Variables** tab → copy the `MYSQL_URL` value.
-3. Run the migration (from this folder):
+Everything the bot remembers about someone lives in **one memory file per user id** —
+a single document keyed by the user id in the `memory` collection:
+
+```jsonc
+{
+  "_id": "<user_id>",
+  "user_id": "<user_id>",
+  "chats":     [ { "role": "user", "message": "…", "timestamp": "…" } ],  // conversation history
+  "matches":   [ { "text": "…", "timestamp": "…" } ],                     // matches that came up
+  "key_facts": [ { "text": "…", "timestamp": "…" } ],                     // notable events / facts
+  "character_facts": "…",   // the memory string sent to the model
+  "created_at": "…",
+  "updated_at": "…"
+}
+```
+
+The collection and its index are created automatically on startup. Because a MongoDB
+document maxes out at 16 MB, each file keeps the most recent `MEMORY_CHAT_LIMIT` chats
+and `MEMORY_FACT_LIMIT` matches / key facts.
+
+## Migrating your old history
+
+`migrate.js` copies existing history into the MongoDB memory files, either from the old
+SQLite database (`wrestling_bot.db`) or from the MySQL database this bot used before.
+
+1. Get your Railway MongoDB URL — on the Railway dashboard, open the MongoDB service →
+   **Variables** tab → copy `MONGO_URL` (or `MONGO_PUBLIC_URL` when running from your own machine).
+2. Run the migration (from this folder):
 
    ```bash
    npm install
-   MYSQL_URL="mysql://user:pass@host:3306/railway" npm run migrate
-   # or, if the database file is somewhere else:
-   node migrate.js /path/to/wrestling_bot.db --url "mysql://user:pass@host:3306/railway"
+
+   # from the old SQLite database
+   MONGO_URL="mongodb://user:pass@host:27017" npm run migrate
+   node migrate.js /path/to/wrestling_bot.db --url "mongodb://user:pass@host:27017"
+
+   # or from the previous MySQL database
+   node migrate.js --from-mysql "mysql://user:pass@host:3306/railway" --url "mongodb://user:pass@host:27017"
    ```
 
-The script copies both `conversations` and `memory` (including timestamps) and is
-safe to run multiple times — rows that are already in MySQL are skipped, and any
-data the app already wrote to MySQL is left untouched.
+The script copies the conversations and the memory string (including timestamps), and
+fills in the `matches` and `key_facts` lists from it. It is safe to run multiple times —
+chats that are already in a memory file are skipped, and anything the app has already
+written to MongoDB is left untouched.
 
-It needs Node >= 22.13 (uses the built-in `node:sqlite`) or the `better-sqlite3`
-package (installed automatically as a dev dependency).
-
+Reading the SQLite source needs Node >= 22.13 (uses the built-in `node:sqlite`) or the
+`better-sqlite3` package; reading the MySQL source needs `mysql2`. Both are installed as
+dev dependencies (`npm install`) and are only used by the migration.

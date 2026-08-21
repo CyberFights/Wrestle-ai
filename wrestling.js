@@ -2,7 +2,13 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
-const mysql = require('mysql2/promise');
+const {
+  initDb,
+  storeMessage,
+  getLastMessages,
+  getCharacterFacts,
+  updateCharacterFacts
+} = require('./memoryStore');
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
@@ -10,67 +16,8 @@ if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
 const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions';
 const MODEL_NAME = 'mistral-large-latest';
 
-// MySQL connection string — Railway injects MYSQL_URL automatically
-// when a MySQL plugin is attached to your service.
-const MYSQL_URL = process.env.MYSQL_URL || process.env.DATABASE_URL;
-if (!MYSQL_URL) throw new Error('MYSQL_URL env variable not set (Railway sets it automatically when a MySQL database is attached)');
-
-const pool = mysql.createPool({
-  uri: MYSQL_URL.replace(/^mysql2:\/\//, 'mysql://'),
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  connectTimeout: 10000,
-  enableKeepAlive: true
-});
-
 const app = express();
 app.use(bodyParser.json());
-
-async function initDb() {
-  // Create tables if they don't exist yet (MySQL syntax)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS conversations (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      user_id TEXT,
-      message TEXT,
-      role TEXT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS memory (
-      user_id VARCHAR(191) PRIMARY KEY,
-      character_facts TEXT
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `);
-}
-
-async function storeMessage(userId, message, role) {
-  await pool.execute('INSERT INTO conversations (user_id, message, role) VALUES (?, ?, ?)', [userId, message, role]);
-}
-
-async function getLastMessages(userId, limit = 10) {
-  const safeLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
-  const [rows] = await pool.execute(
-    `SELECT role, message FROM conversations WHERE user_id = ? ORDER BY timestamp DESC LIMIT ${safeLimit}`,
-    [userId]
-  );
-  return rows.reverse().map(row => ({ role: row.role, content: row.message }));
-}
-
-async function getCharacterFacts(userId) {
-  const [rows] = await pool.execute('SELECT character_facts FROM memory WHERE user_id = ?', [userId]);
-  return rows.length ? rows[0].character_facts : '';
-}
-
-async function updateCharacterFacts(userId, facts) {
-  await pool.execute(
-    `INSERT INTO memory (user_id, character_facts) VALUES (?, ?)
-     ON DUPLICATE KEY UPDATE character_facts = VALUES(character_facts)`,
-    [userId, facts]
-  );
-}
 
 // ---------- DAMAGE ENGINE HELPERS ----------
 
@@ -439,6 +386,6 @@ initDb()
     server.headersTimeout = 62000;
   })
   .catch((error) => {
-    console.error('Failed to connect to MySQL:', error.message);
+    console.error('Failed to connect to MongoDB:', error.message);
     process.exit(1);
   });

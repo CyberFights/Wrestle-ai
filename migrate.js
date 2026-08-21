@@ -2,23 +2,31 @@
 'use strict';
 
 /*
- * migrate.js — copy history from the old SQLite database (wrestling_bot.db)
- * into the MySQL database used by the app (Railway's MYSQL_URL).
+ * migrate.js — copy existing history into the MongoDB memory files used by the
+ * app (Railway's MONGO_URL).
+ *
+ * Sources:
+ *   • the old SQLite database (wrestling_bot.db) — default
+ *   • the previous MySQL database  — pass --from-mysql "mysql://user:pass@host:3306/railway"
  *
  * Usage:
- *   MYSQL_URL="mysql://user:pass@host:3306/railway" node migrate.js [path/to/wrestling_bot.db]
- *   node migrate.js path/to/wrestling_bot.db --url "mysql://user:pass@host:3306/railway"
+ *   MONGO_URL="mongodb://user:pass@host:27017" node migrate.js [path/to/wrestling_bot.db]
+ *   node migrate.js path/to/wrestling_bot.db --url "mongodb://user:pass@host:27017"
+ *   node migrate.js --from-mysql "mysql://user:pass@host:3306/railway" --url "mongodb://…"
  *
- * Copies both tables (conversations and memory) and preserves timestamps.
- * Idempotent: rows that already exist in MySQL (from a previous run or from
- * the app itself) are detected and skipped, so running it twice is safe.
+ * Everything ends up in one memory file per user id:
+ *   { _id: <user_id>, chats: [...], matches: [...], key_facts: [...], character_facts: "…" }
  *
- * Requires Node >= 22.13 (built-in node:sqlite) or the better-sqlite3 package.
+ * Idempotent: chats already present in the memory file (from a previous run or
+ * from the app itself) are detected and skipped, so running it twice is safe.
+ *
+ * The SQLite source requires Node >= 22.13 (built-in node:sqlite) or the
+ * better-sqlite3 package; the MySQL source requires the mysql2 package.
  */
 
 const fs = require('fs');
 const path = require('path');
-const mysql = require('mysql2/promise');
+const { MongoClient } = require('mongodb');
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -27,34 +35,77 @@ const mysql = require('mysql2/promise');
 function parseArgs(argv) {
   let dbPath = null;
   let url = null;
+  let mysqlUrl = null;
+  let dbName = null;
+  let collectionName = null;
   for (let i = 0; i < argv.length; i += 1) {
-    if (argv[i] === '--url') {
+    if (argv[i] === '--url' || argv[i] === '--mongo-url') {
       url = argv[i + 1];
+      i += 1;
+    } else if (argv[i] === '--from-mysql') {
+      mysqlUrl = argv[i + 1];
+      i += 1;
+    } else if (argv[i] === '--db') {
+      dbName = argv[i + 1];
+      i += 1;
+    } else if (argv[i] === '--collection') {
+      collectionName = argv[i + 1];
       i += 1;
     } else if (!argv[i].startsWith('-') && dbPath === null) {
       dbPath = argv[i];
     }
   }
-  return { dbPath, url };
+  return { dbPath, url, mysqlUrl, dbName, collectionName };
 }
 
-const { dbPath, url } = parseArgs(process.argv.slice(2));
-const MYSQL_URL = url || process.env.MYSQL_URL || process.env.DATABASE_URL;
-const DB_FILE = path.resolve(dbPath || path.join(process.cwd(), 'wrestling_bot.db'));
-const BATCH_SIZE = 250;
+const { dbPath, url, mysqlUrl, dbName, collectionName } = parseArgs(process.argv.slice(2));
 
-if (!MYSQL_URL) {
-  console.error('No MySQL URL provided. Set MYSQL_URL or pass --url "mysql://..."');
+const MONGO_URL =
+  url ||
+  process.env.MONGO_URL ||
+  process.env.MONGODB_URI ||
+  process.env.MONGO_PUBLIC_URL ||
+  process.env.DATABASE_URL;
+const MYSQL_URL = mysqlUrl || process.env.MYSQL_URL;
+const DB_NAME = dbName || process.env.MONGO_DB_NAME || dbNameFromUrl(MONGO_URL) || 'wrestling_bot';
+const COLLECTION_NAME = collectionName || process.env.MONGO_MEMORY_COLLECTION || 'memory';
+const DB_FILE = path.resolve(dbPath || path.join(process.cwd(), 'wrestling_bot.db'));
+
+// Same rule as the app: use the database from the URL when it has one.
+function dbNameFromUrl(url) {
+  if (!url) return null;
+  const withoutScheme = String(url).replace(/^mongodb(\+srv)?:\/\//, '');
+  const slash = withoutScheme.indexOf('/');
+  if (slash === -1) return null;
+  const name = withoutScheme.slice(slash + 1).split('?')[0];
+  if (!name) return null;
+  try {
+    return decodeURIComponent(name);
+  } catch (err) {
+    return name;
+  }
+}
+
+function toPositiveInt(value, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+const CHAT_LIMIT = toPositiveInt(process.env.MEMORY_CHAT_LIMIT, 2000);
+const FACT_LIMIT = toPositiveInt(process.env.MEMORY_FACT_LIMIT, 500);
+
+if (!MONGO_URL) {
+  console.error('No MongoDB URL provided. Set MONGO_URL or pass --url "mongodb://…"');
   process.exit(1);
 }
-if (!fs.existsSync(DB_FILE)) {
+if (!MYSQL_URL && !fs.existsSync(DB_FILE)) {
   console.error(`SQLite database not found: ${DB_FILE}`);
   console.error('Pass the path to your old database, e.g.  node migrate.js /path/to/wrestling_bot.db');
+  console.error('…or migrate from the previous MySQL database with  --from-mysql "mysql://…"');
   process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
-// SQLite reader — node:sqlite (Node >= 22.13) or better-sqlite3 (fallback)
+// Sources
 // ---------------------------------------------------------------------------
 
 function openSqlite(file) {
@@ -93,22 +144,119 @@ function openBetterSqlite(file, previousError) {
   }
 }
 
+// Reads the old tables out of SQLite.
+function readFromSqlite(file) {
+  const sqlite = openSqlite(file);
+  console.log(`Reading ${file} with ${sqlite.driver}…`);
+  try {
+    let conversations = [];
+    let memory = [];
+    try {
+      conversations = sqlite.all('SELECT user_id, message, role, timestamp FROM conversations ORDER BY rowid');
+    } catch (err) {
+      console.warn(`  conversations table not found in SQLite, skipping (${err.message})`);
+    }
+    try {
+      memory = sqlite.all('SELECT user_id, character_facts FROM memory');
+    } catch (err) {
+      console.warn(`  memory table not found in SQLite, skipping (${err.message})`);
+    }
+    return { conversations, memory };
+  } finally {
+    try {
+      sqlite.close();
+    } catch (err) {
+      // already closed — fine
+    }
+  }
+}
+
+// Reads the old tables out of the previous MySQL database.
+async function readFromMysql(connectionUrl) {
+  let mysql;
+  try {
+    mysql = require('mysql2/promise');
+  } catch (err) {
+    throw new Error(
+      'Reading from MySQL needs the mysql2 package. Install it first:  npm install mysql2\n' +
+      `  ${err.message}`
+    );
+  }
+
+  console.log('Reading the previous MySQL database…');
+  const connection = await mysql.createConnection({
+    uri: connectionUrl.replace(/^mysql2:\/\//, 'mysql://'),
+    charset: 'utf8mb4',
+    connectTimeout: 10000,
+    dateStrings: true
+  });
+
+  try {
+    let conversations = [];
+    let memory = [];
+    try {
+      const [rows] = await connection.query('SELECT user_id, message, role, timestamp FROM conversations ORDER BY id');
+      conversations = rows;
+    } catch (err) {
+      console.warn(`  conversations table not found in MySQL, skipping (${err.message})`);
+    }
+    try {
+      const [rows] = await connection.query('SELECT user_id, character_facts FROM memory');
+      memory = rows;
+    } catch (err) {
+      console.warn(`  memory table not found in MySQL, skipping (${err.message})`);
+    }
+    return { conversations, memory };
+  } finally {
+    await connection.end();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// SQLite stores CURRENT_TIMESTAMP as 'YYYY-MM-DD HH:MM:SS' (UTC).
-// Accept 'T' separators too; anything else falls back to the DB default.
+// SQLite/MySQL store timestamps as 'YYYY-MM-DD HH:MM:SS' (UTC).
+// Accept 'T' separators and Date objects too.
 function normalizeTimestamp(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
   if (typeof value !== 'string') return null;
   const m = value.trim().match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
-  return m ? `${m[1]} ${m[2]}` : null;
+  if (!m) return null;
+  const date = new Date(`${m[1]}T${m[2]}Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
-// Fingerprint of one conversation row, used to skip rows that were already
-// migrated on a previous run (the table has no unique key to rely on).
-function conversationFingerprint(userId, message, role, timestamp) {
-  return JSON.stringify([userId, message, role, timestamp]);
+// Fingerprint of one chat entry, used to skip entries that are already in the
+// memory file (there is no unique key to rely on).
+function chatFingerprint(role, message, timestamp) {
+  return JSON.stringify([role, message, timestamp ? timestamp.toISOString() : null]);
+}
+
+// Same segment parsing as the app: " | New match discussed: …" / " | Notable event: …"
+const FACT_MARKER = /\s*\|\s*(New match discussed|Notable event):\s*/g;
+
+function parseFactEntries(text) {
+  const matches = [];
+  const keyFacts = [];
+  if (!text) return { matches, keyFacts };
+
+  const markers = [];
+  FACT_MARKER.lastIndex = 0;
+  let found;
+  while ((found = FACT_MARKER.exec(text)) !== null) {
+    markers.push({ type: found[1], start: found.index, end: FACT_MARKER.lastIndex });
+  }
+
+  for (let i = 0; i < markers.length; i += 1) {
+    const next = markers[i + 1];
+    const body = text.slice(markers[i].end, next ? next.start : undefined).trim();
+    if (!body) continue;
+    if (markers[i].type === 'New match discussed') matches.push(body);
+    else keyFacts.push(body);
+  }
+
+  return { matches, keyFacts };
 }
 
 // ---------------------------------------------------------------------------
@@ -116,179 +264,187 @@ function conversationFingerprint(userId, message, role, timestamp) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const sqlite = openSqlite(DB_FILE);
-  console.log(`Reading ${DB_FILE} with ${sqlite.driver}…`);
-
-  const pool = mysql.createPool({
-    uri: MYSQL_URL.replace(/^mysql2:\/\//, 'mysql://'),
-    charset: 'utf8mb4',
-    waitForConnections: true,
-    connectionLimit: 5,
-    connectTimeout: 10000,
-    dateStrings: true // return DATETIME as 'YYYY-MM-DD HH:MM:SS' so fingerprints match
-  });
-
-  // Rows already present in MySQL (from a previous migration run or from the
-  // app itself) are skipped, so re-running the migration is safe.
-  async function getExistingFingerprints(userIds) {
-    if (!userIds.length) return new Set();
-    const [rows] = await pool.execute(
-      `SELECT user_id, message, role, timestamp FROM conversations
-       WHERE user_id IN (${userIds.map(() => '?').join(',')})`,
-      userIds
-    );
-    return new Set(rows.map(r => conversationFingerprint(
-      String(r.user_id ?? ''),
-      String(r.message ?? ''),
-      String(r.role ?? ''),
-      normalizeTimestamp(r.timestamp)
-    )));
+  let source;
+  try {
+    source = MYSQL_URL ? await readFromMysql(MYSQL_URL) : readFromSqlite(DB_FILE);
+  } catch (err) {
+    console.error(`Could not read the source database: ${err.message}`);
+    process.exitCode = 1;
+    return;
   }
 
+  const client = new MongoClient(MONGO_URL, {
+    connectTimeoutMS: 10000,
+    serverSelectionTimeoutMS: 10000
+  });
+
   try {
-    // Same schema as wrestling.js
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS conversations (
-        id BIGINT AUTO_INCREMENT PRIMARY KEY,
-        user_id TEXT,
-        message TEXT,
-        role TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS memory (
-        user_id VARCHAR(191) PRIMARY KEY,
-        character_facts TEXT
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
+    await client.connect();
+    const memoryFiles = client.db(DB_NAME).collection(COLLECTION_NAME);
+    await memoryFiles.createIndex({ user_id: 1 });
 
-    // ---- conversations ----
-    let convRows = [];
-    try {
-      convRows = sqlite.all('SELECT user_id, message, role, timestamp FROM conversations ORDER BY rowid');
-    } catch (err) {
-      console.warn(`  conversations table not found in SQLite, skipping (${err.message})`);
+    // ---- group the source rows per user ----
+    const users = new Map();
+    function userEntry(rawUserId) {
+      const userId = rawUserId == null ? '' : String(rawUserId);
+      if (!users.has(userId)) users.set(userId, { chats: [], characterFacts: null });
+      return users.get(userId);
     }
 
-    let inserted = 0;
-    let skipped = 0;
     let convBadUsers = 0;
-
-    for (let i = 0; i < convRows.length; i += BATCH_SIZE) {
-      const batch = convRows.slice(i, i + BATCH_SIZE);
-
-      // Normalize the batch rows first
-      const normalized = [];
-      for (const r of batch) {
-        const userId = r.user_id == null ? '' : String(r.user_id);
-        if (userId.length > 191) {
-          convBadUsers += 1;
-          continue;
-        }
-        normalized.push([
-          userId,
-          r.message == null ? '' : String(r.message),
-          r.role == null ? '' : String(r.role),
-          normalizeTimestamp(r.timestamp)
-        ]);
+    for (const row of source.conversations) {
+      const userId = row.user_id == null ? '' : String(row.user_id);
+      if (!userId) {
+        convBadUsers += 1;
+        continue;
       }
-      if (!normalized.length) continue;
-
-      // Skip rows that are already in MySQL
-      const userIds = [...new Set(normalized.map(row => row[0]))];
-      const existing = await getExistingFingerprints(userIds);
-
-      // Rows without a usable source timestamp get CURRENT_TIMESTAMP at
-      // insert, so on a re-run they are matched by content alone.
-      const nullTimestampRows = normalized.filter(row => row[3] === null);
-      let anyTimestamp = new Set();
-      if (nullTimestampRows.length) {
-        const [rows] = await pool.execute(
-          `SELECT user_id, message, role FROM conversations
-           WHERE user_id IN (${userIds.map(() => '?').join(',')})`,
-          userIds
-        );
-        anyTimestamp = new Set(rows.map(r => `${r.user_id}|${r.message}|${r.role}`));
-      }
-
-      const toInsert = normalized.filter(row => {
-        if (row[3] === null) {
-          const key = `${row[0]}|${row[1]}|${row[2]}`;
-          if (anyTimestamp.has(key)) {
-            skipped += 1;
-            return false;
-          }
-          return true;
-        }
-        const fp = conversationFingerprint(row[0], row[1], row[2], row[3]);
-        if (existing.has(fp)) {
-          skipped += 1;
-          return false;
-        }
-        return true;
+      userEntry(userId).chats.push({
+        role: row.role == null ? '' : String(row.role),
+        message: row.message == null ? '' : String(row.message),
+        timestamp: normalizeTimestamp(row.timestamp)
       });
-      if (!toInsert.length) continue;
-
-      const placeholders = toInsert.map(() => '(?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))').join(', ');
-      const [result] = await pool.execute(
-        `INSERT INTO conversations (user_id, message, role, timestamp) VALUES ${placeholders}`,
-        toInsert.flat()
-      );
-      inserted += result.affectedRows;
     }
 
-    console.log(`conversations: ${convRows.length} read, ${inserted} inserted, ${skipped} already present` +
-      (convBadUsers ? `, ${convBadUsers} skipped (user_id longer than 191 chars)` : ''));
-
-    // ---- memory ----
-    let memRows = [];
-    try {
-      memRows = sqlite.all('SELECT user_id, character_facts FROM memory');
-    } catch (err) {
-      console.warn(`  memory table not found in SQLite, skipping (${err.message})`);
-    }
-
-    let memInserted = 0;
-    let memSkipped = 0;
     let memBadUsers = 0;
-    for (const r of memRows) {
-      const userId = r.user_id == null ? '' : String(r.user_id);
-      if (!userId || userId.length > 191) {
+    for (const row of source.memory) {
+      const userId = row.user_id == null ? '' : String(row.user_id);
+      if (!userId) {
         memBadUsers += 1;
         continue;
       }
-      const [result] = await pool.execute(
-        'INSERT IGNORE INTO memory (user_id, character_facts) VALUES (?, ?)',
-        [userId, r.character_facts == null ? '' : String(r.character_facts)]
-      );
-      if (result.affectedRows > 0) memInserted += 1;
-      else memSkipped += 1;
+      userEntry(userId).characterFacts = row.character_facts == null ? '' : String(row.character_facts);
     }
 
-    console.log(`memory: ${memRows.length} read, ${memInserted} inserted, ${memSkipped} already present` +
-      (memBadUsers ? `, ${memBadUsers} skipped (user_id longer than 191 chars)` : ''));
+    // ---- merge into the memory files ----
+    let insertedChats = 0;
+    let skippedChats = 0;
+    let trimmedChats = 0;
+    let newFiles = 0;
+    let updatedFiles = 0;
+    let factsWritten = 0;
+    let factsKept = 0;
+
+    for (const [userId, entry] of users) {
+      const existing = await memoryFiles.findOne({ _id: userId });
+      const now = new Date();
+
+      // chats — keep what is already there, add only the missing ones
+      const existingChats = (existing && Array.isArray(existing.chats) ? existing.chats : []).map(chat => ({
+        role: chat.role == null ? '' : String(chat.role),
+        message: chat.message == null ? '' : String(chat.message),
+        timestamp: chat.timestamp instanceof Date ? chat.timestamp : normalizeTimestamp(chat.timestamp)
+      }));
+      const seen = new Set(existingChats.map(c => chatFingerprint(c.role, c.message, c.timestamp)));
+      const seenWithoutTime = new Set(existingChats.map(c => `${c.role}|${c.message}`));
+
+      const toAdd = [];
+      for (const chat of entry.chats) {
+        // Entries without a usable source timestamp are matched by content alone.
+        const key = chat.timestamp
+          ? chatFingerprint(chat.role, chat.message, chat.timestamp)
+          : `${chat.role}|${chat.message}`;
+        const pool = chat.timestamp ? seen : seenWithoutTime;
+        if (pool.has(key)) {
+          skippedChats += 1;
+          continue;
+        }
+        pool.add(key);
+        toAdd.push({ ...chat, timestamp: chat.timestamp || now });
+      }
+
+      let mergedChats = existingChats.concat(toAdd);
+      mergedChats.sort((a, b) => {
+        const at = a.timestamp ? a.timestamp.getTime() : 0;
+        const bt = b.timestamp ? b.timestamp.getTime() : 0;
+        return at - bt;
+      });
+      if (mergedChats.length > CHAT_LIMIT) {
+        trimmedChats += mergedChats.length - CHAT_LIMIT;
+        mergedChats = mergedChats.slice(-CHAT_LIMIT);
+      }
+
+      // character facts — never overwrite what the app already stored
+      const existingFacts = existing && existing.character_facts != null ? String(existing.character_facts) : '';
+      let characterFacts = existingFacts;
+      if (entry.characterFacts) {
+        if (existingFacts) factsKept += 1;
+        else {
+          characterFacts = entry.characterFacts;
+          factsWritten += 1;
+        }
+      }
+
+      // matches / key facts — rebuilt from the memory string
+      const parsed = parseFactEntries(characterFacts);
+      const existingMatches = existing && Array.isArray(existing.matches) ? existing.matches : [];
+      const existingKeyFacts = existing && Array.isArray(existing.key_facts) ? existing.key_facts : [];
+      const knownMatches = new Set(existingMatches.map(m => (m && m.text != null ? String(m.text) : '')));
+      const knownKeyFacts = new Set(existingKeyFacts.map(m => (m && m.text != null ? String(m.text) : '')));
+
+      const matches = existingMatches.concat(
+        parsed.matches.filter(text => !knownMatches.has(text)).map(text => ({ text, timestamp: now }))
+      ).slice(-FACT_LIMIT);
+      const keyFacts = existingKeyFacts.concat(
+        parsed.keyFacts.filter(text => !knownKeyFacts.has(text)).map(text => ({ text, timestamp: now }))
+      ).slice(-FACT_LIMIT);
+
+      await memoryFiles.updateOne(
+        { _id: userId },
+        {
+          $setOnInsert: { user_id: userId, created_at: now },
+          $set: {
+            chats: mergedChats,
+            matches,
+            key_facts: keyFacts,
+            character_facts: characterFacts,
+            updated_at: now
+          }
+        },
+        { upsert: true }
+      );
+
+      insertedChats += toAdd.length;
+      if (existing) updatedFiles += 1;
+      else newFiles += 1;
+    }
+
+    console.log(
+      `chats: ${source.conversations.length} read, ${insertedChats} added, ${skippedChats} already present` +
+      (trimmedChats ? `, ${trimmedChats} trimmed (older than the last ${CHAT_LIMIT})` : '') +
+      (convBadUsers ? `, ${convBadUsers} skipped (empty user_id)` : '')
+    );
+    console.log(
+      `character facts: ${source.memory.length} read, ${factsWritten} written, ${factsKept} left untouched (already in MongoDB)` +
+      (memBadUsers ? `, ${memBadUsers} skipped (empty user_id)` : '')
+    );
+    console.log(`memory files: ${newFiles} created, ${updatedFiles} updated`);
 
     // ---- verification ----
-    const [[convCount]] = await pool.query('SELECT COUNT(*) AS n FROM conversations');
-    const [[memCount]] = await pool.query('SELECT COUNT(*) AS n FROM memory');
-    console.log(`\nVerification — MySQL now contains ${convCount.n} conversation rows and ${memCount.n} memory rows.`);
-    if (convCount.n < convRows.length) {
-      console.log('Note: MySQL already contained some of these rows (they were kept as-is).');
-    }
+    const fileCount = await memoryFiles.countDocuments();
+    const [totals] = await memoryFiles.aggregate([
+      {
+        $group: {
+          _id: null,
+          chats: { $sum: { $size: { $ifNull: ['$chats', []] } } },
+          matches: { $sum: { $size: { $ifNull: ['$matches', []] } } },
+          keyFacts: { $sum: { $size: { $ifNull: ['$key_facts', []] } } }
+        }
+      }
+    ]).toArray();
+
+    console.log(
+      `\nVerification — ${DB_NAME}.${COLLECTION_NAME} now holds ${fileCount} memory file(s) with ` +
+      `${totals ? totals.chats : 0} chats, ${totals ? totals.matches : 0} matches and ` +
+      `${totals ? totals.keyFacts : 0} key facts.`
+    );
   } catch (err) {
     console.error(`Migration failed: ${err.message}`);
     process.exitCode = 1;
   } finally {
     try {
-      await pool.end();
+      await client.close();
     } catch (err) {
-      console.error(`Warning: could not close the MySQL pool cleanly: ${err.message}`);
-    }
-    try {
-      sqlite.close();
-    } catch (err) {
-      // already closed — fine
+      console.error(`Warning: could not close the MongoDB client cleanly: ${err.message}`);
     }
   }
 }

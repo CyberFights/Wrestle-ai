@@ -16,14 +16,30 @@ Uses a **MongoDB** database (via the official `mongodb` driver) — designed to 
 Optional:
 
 - `MONGO_DB_NAME` — database to use (default: the one in `MONGO_URL`, otherwise `wrestling_bot`).
-- `MONGO_MEMORY_COLLECTION` — collection holding the memory files (default `memory`).
+- `MONGO_MEMORY_COLLECTION` — name of the legacy flat collection (default `memory`). Only used
+  to migrate old data into per-user folders on startup.
 - `MEMORY_CHAT_LIMIT` — how many chats each memory file keeps (default `2000`).
 - `MEMORY_FACT_LIMIT` — how many matches / key facts each memory file keeps (default `500`).
 
 ## How memory is stored
 
-Everything the bot remembers about someone lives in **one memory file per user id** —
-a single document keyed by the user id in the `memory` collection:
+The bot's memory lives in the MongoDB database (the "memory folder"). Inside it, **every
+user gets their own folder** — their own MongoDB collection — and everything remembered
+about that user is written to and pulled from that folder:
+
+```
+<database>/          ← the memory folder
+├── memory_r_12345   ← one user's folder
+├── memory_r_67890   ← another user's folder
+└── …
+```
+
+The folder name is derived from the user id (`memory_r_<user_id>` for ids made of letters,
+digits, `-` and `_`; `memory_b_<base64url>` or `memory_h_<sha256>` for anything else), so it
+is always unique per user and always valid in MongoDB. A new user's folder is created
+automatically the first time anything is stored or read for them.
+
+Each folder holds **one memory file** — a single document keyed by the user id:
 
 ```jsonc
 {
@@ -38,9 +54,13 @@ a single document keyed by the user id in the `memory` collection:
 }
 ```
 
-The collection and its index are created automatically on startup. Because a MongoDB
-document maxes out at 16 MB, each file keeps the most recent `MEMORY_CHAT_LIMIT` chats
-and `MEMORY_FACT_LIMIT` matches / key facts.
+Folders and their indexes are created automatically. Because a MongoDB document maxes out
+at 16 MB, each file keeps the most recent `MEMORY_CHAT_LIMIT` chats and `MEMORY_FACT_LIMIT`
+matches / key facts.
+
+On startup, any users still stored in the old flat `memory` collection (from a previous
+version of this bot) are moved into their own folders automatically — this is idempotent,
+so restarting never duplicates anything.
 
 ## Migrating your old history
 

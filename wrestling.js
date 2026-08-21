@@ -12,7 +12,7 @@ const MODEL_NAME = 'mistral-large-latest';
 
 // MySQL connection string — Railway injects MYSQL_URL automatically
 // when a MySQL plugin is attached to your service.
-const MYSQL_URL = process.env.MYSQL_URL || process.env.DATABASE_URL;
+const MYSQL_URL = process.env.MYSQL_DATABASE || process.env.DATABASE_URL;
 if (!MYSQL_URL) throw new Error('MYSQL_URL env variable not set (Railway sets it automatically when a MySQL database is attached)');
 
 const pool = mysql.createPool({

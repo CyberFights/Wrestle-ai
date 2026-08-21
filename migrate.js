@@ -14,11 +14,15 @@
  *   node migrate.js path/to/wrestling_bot.db --url "mongodb://user:pass@host:27017"
  *   node migrate.js --from-mysql "mysql://user:pass@host:3306/railway" --url "mongodb://…"
  *
- * Everything ends up in one memory file per user id:
+ * Everything ends up in each user's own memory folder — a per-user MongoDB
+ * collection (memory_r_<user_id>, memory_b_<…>, or memory_h_<…>) holding one
+ * memory file:
  *   { _id: <user_id>, chats: [...], matches: [...], key_facts: [...], character_facts: "…" }
  *
- * Idempotent: chats already present in the memory file (from a previous run or
- * from the app itself) are detected and skipped, so running it twice is safe.
+ * Users still living in the old flat `memory` collection are moved into their
+ * own folders first. Idempotent: chats already present in a memory file (from a
+ * previous run or from the app itself) are detected and skipped, so running it
+ * twice is safe.
  *
  * The SQLite source requires Node >= 22.13 (built-in node:sqlite) or the
  * better-sqlite3 package; the MySQL source requires the mysql2 package.
@@ -27,6 +31,7 @@
 const fs = require('fs');
 const path = require('path');
 const { MongoClient } = require('mongodb');
+const { collectionNameForUser, isUserFolderName } = require('./memoryFolders');
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -280,8 +285,52 @@ async function main() {
 
   try {
     await client.connect();
-    const memoryFiles = client.db(DB_NAME).collection(COLLECTION_NAME);
-    await memoryFiles.createIndex({ user_id: 1 });
+    const database = client.db(DB_NAME);
+
+    // Each user's memory folder (their own collection). `createIndex` also
+    // creates the collection on first use, so a new user gets their folder here.
+    const indexedFolders = new Set();
+    async function ensureFolder(userId) {
+      const folder = database.collection(collectionNameForUser(userId));
+      const name = folder.collectionName;
+      if (!indexedFolders.has(name)) {
+        await folder.createIndex({ user_id: 1 });
+        indexedFolders.add(name);
+      }
+      return folder;
+    }
+
+    // ---- move users from the old flat `memory` collection into folders ----
+    let legacyMigrated = 0;
+    let legacySkipped = 0;
+    let legacyFound = false;
+    try {
+      legacyFound = await database.listCollections({ name: COLLECTION_NAME }, { nameOnly: true }).hasNext();
+    } catch (err) {
+      legacyFound = false;
+    }
+    if (legacyFound) {
+      const legacy = database.collection(COLLECTION_NAME);
+      const legacyCursor = legacy.find({});
+      while (await legacyCursor.hasNext()) {
+        const doc = await legacyCursor.next();
+        const legacyUserId = doc.user_id != null
+          ? String(doc.user_id)
+          : (doc._id != null ? String(doc._id) : '');
+        if (!legacyUserId) {
+          legacySkipped += 1;
+          continue;
+        }
+        const folder = await ensureFolder(legacyUserId);
+        const alreadyThere = await folder.findOne({ _id: legacyUserId });
+        if (alreadyThere) {
+          legacySkipped += 1;
+          continue;
+        }
+        await folder.insertOne({ ...doc, _id: legacyUserId, user_id: legacyUserId });
+        legacyMigrated += 1;
+      }
+    }
 
     // ---- group the source rows per user ----
     const users = new Map();
@@ -325,7 +374,8 @@ async function main() {
     let factsKept = 0;
 
     for (const [userId, entry] of users) {
-      const existing = await memoryFiles.findOne({ _id: userId });
+      const folder = await ensureFolder(userId);
+      const existing = await folder.findOne({ _id: userId });
       const now = new Date();
 
       // chats — keep what is already there, add only the missing ones
@@ -388,7 +438,7 @@ async function main() {
         parsed.keyFacts.filter(text => !knownKeyFacts.has(text)).map(text => ({ text, timestamp: now }))
       ).slice(-FACT_LIMIT);
 
-      await memoryFiles.updateOne(
+      await folder.updateOne(
         { _id: userId },
         {
           $setOnInsert: { user_id: userId, created_at: now },
@@ -418,24 +468,48 @@ async function main() {
       (memBadUsers ? `, ${memBadUsers} skipped (empty user_id)` : '')
     );
     console.log(`memory files: ${newFiles} created, ${updatedFiles} updated`);
+    if (legacyFound) {
+      console.log(
+        `legacy "memory" collection: ${legacyMigrated} user(s) moved into their own folder, ` +
+        `${legacySkipped} already in place`
+      );
+    }
 
-    // ---- verification ----
-    const fileCount = await memoryFiles.countDocuments();
-    const [totals] = await memoryFiles.aggregate([
-      {
-        $group: {
-          _id: null,
-          chats: { $sum: { $size: { $ifNull: ['$chats', []] } } },
-          matches: { $sum: { $size: { $ifNull: ['$matches', []] } } },
-          keyFacts: { $sum: { $size: { $ifNull: ['$key_facts', []] } } }
+    // ---- verification (summed across every user's folder) ----
+    const folderNames = [];
+    const folderCursor = database.listCollections({}, { nameOnly: true });
+    while (await folderCursor.hasNext()) {
+      const { name } = await folderCursor.next();
+      if (isUserFolderName(name)) folderNames.push(name);
+    }
+
+    let fileCount = 0;
+    let totalChats = 0;
+    let totalMatches = 0;
+    let totalKeyFacts = 0;
+    for (const name of folderNames) {
+      const folder = database.collection(name);
+      fileCount += await folder.countDocuments();
+      const [totals] = await folder.aggregate([
+        {
+          $group: {
+            _id: null,
+            chats: { $sum: { $size: { $ifNull: ['$chats', []] } } },
+            matches: { $sum: { $size: { $ifNull: ['$matches', []] } } },
+            keyFacts: { $sum: { $size: { $ifNull: ['$key_facts', []] } } }
+          }
         }
+      ]).toArray();
+      if (totals) {
+        totalChats += totals.chats;
+        totalMatches += totals.matches;
+        totalKeyFacts += totals.keyFacts;
       }
-    ]).toArray();
+    }
 
     console.log(
-      `\nVerification — ${DB_NAME}.${COLLECTION_NAME} now holds ${fileCount} memory file(s) with ` +
-      `${totals ? totals.chats : 0} chats, ${totals ? totals.matches : 0} matches and ` +
-      `${totals ? totals.keyFacts : 0} key facts.`
+      `\nVerification — ${DB_NAME} now holds ${folderNames.length} user folder(s) (${fileCount} memory file(s)) with ` +
+      `${totalChats} chats, ${totalMatches} matches and ${totalKeyFacts} key facts.`
     );
   } catch (err) {
     console.error(`Migration failed: ${err.message}`);

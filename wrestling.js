@@ -2,7 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
-const Database = require('better-sqlite3');
+const mysql = require('mysql2/promise');
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
@@ -10,47 +10,66 @@ if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
 const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions';
 const MODEL_NAME = 'mistral-large-latest';
 
-const DB_FILE = 'wrestling_bot.db';
-const db = new Database(DB_FILE);
+// MySQL connection string — Railway injects MYSQL_URL automatically
+// when a MySQL plugin is attached to your service.
+const MYSQL_URL = process.env.MYSQL_URL || process.env.DATABASE_URL;
+if (!MYSQL_URL) throw new Error('MYSQL_URL env variable not set (Railway sets it automatically when a MySQL database is attached)');
+
+const pool = mysql.createPool({
+  uri: MYSQL_URL.replace(/^mysql2:\/\//, 'mysql://'),
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  connectTimeout: 10000,
+  enableKeepAlive: true
+});
 
 const app = express();
 app.use(bodyParser.json());
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS conversations (
-    user_id TEXT,
-    message TEXT,
-    role TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+async function initDb() {
+  // Create tables if they don't exist yet (MySQL syntax)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      user_id TEXT,
+      message TEXT,
+      role TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS memory (
+      user_id VARCHAR(191) PRIMARY KEY,
+      character_facts TEXT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+}
+
+async function storeMessage(userId, message, role) {
+  await pool.execute('INSERT INTO conversations (user_id, message, role) VALUES (?, ?, ?)', [userId, message, role]);
+}
+
+async function getLastMessages(userId, limit = 10) {
+  const safeLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+  const [rows] = await pool.execute(
+    `SELECT role, message FROM conversations WHERE user_id = ? ORDER BY timestamp DESC LIMIT ${safeLimit}`,
+    [userId]
   );
-  CREATE TABLE IF NOT EXISTS memory (
-    user_id TEXT PRIMARY KEY,
-    character_facts TEXT
+  return rows.reverse().map(row => ({ role: row.role, content: row.message }));
+}
+
+async function getCharacterFacts(userId) {
+  const [rows] = await pool.execute('SELECT character_facts FROM memory WHERE user_id = ?', [userId]);
+  return rows.length ? rows[0].character_facts : '';
+}
+
+async function updateCharacterFacts(userId, facts) {
+  await pool.execute(
+    `INSERT INTO memory (user_id, character_facts) VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE character_facts = VALUES(character_facts)`,
+    [userId, facts]
   );
-`);
-
-function storeMessage(userId, message, role) {
-  db.prepare('INSERT INTO conversations (user_id, message, role) VALUES (?, ?, ?)')
-    .run(userId, message, role);
-}
-
-function getLastMessages(userId, limit = 10) {
-  return db.prepare('SELECT role, message FROM conversations WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?')
-    .all(userId, limit)
-    .reverse()
-    .map(row => ({ role: row.role, content: row.message }));
-}
-
-function getCharacterFacts(userId) {
-  const row = db.prepare('SELECT character_facts FROM memory WHERE user_id = ?').get(userId);
-  return row ? row.character_facts : '';
-}
-
-function updateCharacterFacts(userId, facts) {
-  db.prepare(`
-    INSERT INTO memory (user_id, character_facts) VALUES (?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET character_facts = excluded.character_facts
-  `).run(userId, facts);
 }
 
 // ---------- DAMAGE ENGINE HELPERS ----------
@@ -250,11 +269,15 @@ and momentum shifts.
 ${in_battle ? '\n' + damageStateText : ''}`;
 
   // Store user message immediately (same as wrestling_chat)
-storeMessage(user_id, message, 'user');
+try {
+  await storeMessage(user_id, message, 'user');
+} catch (error) {
+  return res.status(500).json({ error: 'Database error', details: error.message });
+}
 
 // Load conversation history + memory
-const chatHistory = getLastMessages(user_id);
-const characterFacts = getCharacterFacts(user_id);
+const chatHistory = await getLastMessages(user_id);
+const characterFacts = await getCharacterFacts(user_id);
 
 const messages = [
   { role: 'system', content: SYSTEM_PROMPT }
@@ -287,7 +310,7 @@ const rawReply = response.data.choices[0].message.content.trim();
 const botReply = sanitizeMoveOutput(rawReply, updatedStats.stamina);
 
 // Store assistant reply
-storeMessage(user_id, botReply, 'assistant');
+await storeMessage(user_id, botReply, 'assistant');
     
     let updatedFacts = characterFacts;
 
@@ -300,7 +323,7 @@ if (message.toLowerCase().match(/slam|cyclone|roar|injur|pain|nsfw|sex|fuck|kiss
 }
 
 if (updatedFacts && updatedFacts !== characterFacts) {
-  updateCharacterFacts(user_id, updatedFacts);
+  await updateCharacterFacts(user_id, updatedFacts);
 }
 
 res.json({
@@ -354,10 +377,14 @@ Energetic first-person mix of internal thoughts + physical action. Emphasize imp
 and momentum shifts.`;
 
 
-  storeMessage(user_id, message, 'user');
+  try {
+    await storeMessage(user_id, message, 'user');
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
 
-  const chatHistory = getLastMessages(user_id);
-  const characterFacts = getCharacterFacts(user_id);
+  const chatHistory = await getLastMessages(user_id);
+  const characterFacts = await getCharacterFacts(user_id);
 
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT }
@@ -382,7 +409,7 @@ and momentum shifts.`;
     });
 
     const botReply = response.data.choices[0].message.content.trim();
-    storeMessage(user_id, botReply, 'assistant');
+    await storeMessage(user_id, botReply, 'assistant');
 
     // Memory update logic (simple)
     let updatedFacts = characterFacts;
@@ -393,7 +420,7 @@ and momentum shifts.`;
       updatedFacts += ` | Notable event: ${message}`;
     }
     if (updatedFacts && updatedFacts !== characterFacts) {
-      updateCharacterFacts(user_id, updatedFacts);
+      await updateCharacterFacts(user_id, updatedFacts);
     }
 
     res.json({ response: botReply });
@@ -402,9 +429,16 @@ and momentum shifts.`;
   }
 });
 
-const port = process.env.PORT || 8080;
-const server = app.listen(port, '0.0.0.0', () => {
-  console.log(`Wrestling bot API running on port ${port}`);
-});
-server.keepAliveTimeout = 61000;
-server.headersTimeout = 62000;
+initDb()
+  .then(() => {
+    const port = process.env.PORT || 8080;
+    const server = app.listen(port, '0.0.0.0', () => {
+      console.log(`Wrestling bot API running on port ${port}`);
+    });
+    server.keepAliveTimeout = 61000;
+    server.headersTimeout = 62000;
+  })
+  .catch((error) => {
+    console.error('Failed to connect to MySQL:', error.message);
+    process.exit(1);
+  });

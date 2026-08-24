@@ -18,49 +18,80 @@ Optional:
 - `MONGO_DB_NAME` — database to use (default: the one in `MONGO_URL`, otherwise `wrestling_bot`).
 - `MONGO_MEMORY_COLLECTION` — name of the legacy flat collection (default `memory`). Only used
   to migrate old data into per-user folders on startup.
-- `MEMORY_CHAT_LIMIT` — how many chats each memory file keeps (default `2000`).
-- `MEMORY_FACT_LIMIT` — how many matches / key facts each memory file keeps (default `500`).
+- `MEMORY_CHAT_LIMIT` — how many chats each chats file keeps (default `2000`).
+- `MEMORY_FACT_LIMIT` — how many matches / key facts each facts file keeps (default `500`).
+- `MODEL_HISTORY_LIMIT` — how many of the most recent chats are sent to the model (default `10`).
+  Only stored history is affected by `MEMORY_CHAT_LIMIT`; the model never sees more than this.
+- `MISTRAL_TIMEOUT_MS` — per-attempt timeout for Mistral API calls (default `30000`).
+- `MISTRAL_MAX_RETRIES` — how many times a failed Mistral call is retried (default `3`).
+  Retries only happen for transient failures — rate limits (429) and server errors
+  (5xx, e.g. the 503 Mistral returns when overloaded), plus timeouts and connection
+  errors — with exponential backoff. Permanent client errors (400/401/…) fail immediately.
+
+## Mistral API errors
+
+Calls to Mistral go through `mistralClient.js`. Never `console.error` a raw axios error
+object from these calls — it contains `config.headers.Authorization`, i.e. the raw API
+key. Use `describeMistralError(error)`, which builds a short summary without any headers;
+that is what the endpoints log and return in the `details` field of an error response.
+
+Run the tests with `npm test` (stubbed Mistral server, no real API key needed).
 
 ## How memory is stored
 
 The bot's memory lives in the MongoDB database (the "memory folder"). Inside it, **every
-user gets their own folder** — their own MongoDB collection — and everything remembered
-about that user is written to and pulled from that folder:
+user gets TWO folders of their own** — two MongoDB collections — one for chat messages
+and one for character facts:
 
 ```
-<database>/          ← the memory folder
-├── memory_r_12345   ← one user's folder
-├── memory_r_67890   ← another user's folder
+<database>/                ← the memory folder
+├── memory_r_12345_chats   ← one user's chat messages folder
+├── memory_r_12345_facts   ← the same user's character facts folder
+├── memory_r_67890_chats   ← another user's chat messages folder
+├── memory_r_67890_facts   ← another user's character facts folder
 └── …
 ```
 
-The folder name is derived from the user id (`memory_r_<user_id>` for ids made of letters,
-digits, `-` and `_`; `memory_b_<base64url>` or `memory_h_<sha256>` for anything else), so it
-is always unique per user and always valid in MongoDB. A new user's folder is created
-automatically the first time anything is stored or read for them.
+Folder names are derived from the user id (`memory_r_<user_id>` for ids made of letters,
+digits, `-` and `_`; `memory_b_<base64url>` or `memory_h_<sha256>` for anything else), with
+`_chats` / `_facts` appended to pick the folder, so they are always unique per user and
+always valid in MongoDB. A new user's folders are created automatically the first time
+anything is stored or read for them.
 
 Each folder holds **one memory file** — a single document keyed by the user id:
 
 ```jsonc
+// <base>_chats — the chat messages folder
 {
   "_id": "<user_id>",
   "user_id": "<user_id>",
-  "chats":     [ { "role": "user", "message": "…", "timestamp": "…" } ],  // conversation history
-  "matches":   [ { "text": "…", "timestamp": "…" } ],                     // matches that came up
-  "key_facts": [ { "text": "…", "timestamp": "…" } ],                     // notable events / facts
+  "chats": [ { "role": "user", "message": "…", "timestamp": "…" } ],  // conversation history
+  "created_at": "…",
+  "updated_at": "…"
+}
+
+// <base>_facts — the character facts folder
+{
+  "_id": "<user_id>",
+  "user_id": "<user_id>",
   "character_facts": "…",   // the memory string sent to the model
+  "matches":   [ { "text": "…", "timestamp": "…" } ],  // matches that came up
+  "key_facts": [ { "text": "…", "timestamp": "…" } ],  // notable events / facts
   "created_at": "…",
   "updated_at": "…"
 }
 ```
 
 Folders and their indexes are created automatically. Because a MongoDB document maxes out
-at 16 MB, each file keeps the most recent `MEMORY_CHAT_LIMIT` chats and `MEMORY_FACT_LIMIT`
-matches / key facts.
+at 16 MB, the chats file keeps the most recent `MEMORY_CHAT_LIMIT` chats and the facts
+file the most recent `MEMORY_FACT_LIMIT` matches / key facts. Only the **10 most recent
+chats** (`MODEL_HISTORY_LIMIT`) are ever sent to the model, no matter how many are stored.
 
-On startup, any users still stored in the old flat `memory` collection (from a previous
-version of this bot) are moved into their own folders automatically — this is idempotent,
-so restarting never duplicates anything.
+On startup, any data still stored in an older layout — the old flat `memory` collection or
+the previous single-folder layout (one folder per user holding chats and facts together) —
+is split into the two folders automatically. This is idempotent and never deletes the
+originals, so restarting never duplicates anything and upgrading never loses data. Once you
+are happy everything moved over, you can drop those old collections by hand.
 
 ## Migrating your old history
 

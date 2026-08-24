@@ -1,20 +1,24 @@
 const express = require('express');
-const axios = require('axios');
 const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
+const { createMistralClient, describeMistralError } = require('./mistralClient');
 const {
   initDb,
   storeMessage,
   getLastMessages,
   getCharacterFacts,
-  updateCharacterFacts
+  updateCharacterFacts,
+  MODEL_HISTORY_LIMIT
 } = require('./memoryStore');
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
 
-const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions';
-const MODEL_NAME = 'mistral-large-latest';
+// Wraps the Mistral API with a timeout, retries on transient failures
+// (429/5xx — e.g. the 503s Mistral returns when overloaded), and leak-safe
+// error descriptions. IMPORTANT: never log a raw axios error object — it
+// contains config.headers.Authorization, i.e. the API key.
+const mistral = createMistralClient({ apiKey: MISTRAL_API_KEY });
 
 const app = express();
 app.use(bodyParser.json());
@@ -222,8 +226,11 @@ try {
   return res.status(500).json({ error: 'Database error', details: error.message });
 }
 
-// Load conversation history + memory
-const chatHistory = await getLastMessages(user_id);
+// Load conversation history + memory.
+// Only the 10 most recent messages (MODEL_HISTORY_LIMIT) are sent to the
+// model — and since storeMessage() above already saved the current message,
+// the history ends with it: do NOT append `message` again here.
+const chatHistory = await getLastMessages(user_id, MODEL_HISTORY_LIMIT);
 const characterFacts = await getCharacterFacts(user_id);
 
 const messages = [
@@ -235,25 +242,8 @@ if (characterFacts) {
 }
 
 chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
-messages.push({ role: 'user', content: message });
 try {
-const response = await axios.post(
-  MISTRAL_URL,
-  {
-    model: MODEL_NAME,
-    messages,
-    max_tokens: 250,
-    temperature: 0.8
-  },
-  {
-    headers: {
-      Authorization: `Bearer ${MISTRAL_API_KEY}`,
-      'Content-Type': 'application/json'
-    }
-  }
-);
-
-const rawReply = response.data.choices[0].message.content.trim();
+const rawReply = await mistral.chat(messages);
 const botReply = sanitizeMoveOutput(rawReply, updatedStats.stamina);
 
 // Store assistant reply
@@ -283,10 +273,12 @@ res.json({
 });
 
 } catch (error) {
-  console.error(error);
+  // describeMistralError never includes headers — safe to log/respond with.
+  const details = describeMistralError(error);
+  console.error(`Mistral API request failed: ${details}`);
   res.status(500).json({
     error: 'Mistral API error',
-    details: error.response?.data || error.message
+    details
   });
 }
 });
@@ -330,7 +322,9 @@ and momentum shifts.`;
     return res.status(500).json({ error: 'Database error', details: error.message });
   }
 
-  const chatHistory = await getLastMessages(user_id);
+  // Only the 10 most recent messages (MODEL_HISTORY_LIMIT) are sent to the
+  // model, ending with the message just stored above.
+  const chatHistory = await getLastMessages(user_id, MODEL_HISTORY_LIMIT);
   const characterFacts = await getCharacterFacts(user_id);
 
   const messages = [
@@ -340,22 +334,9 @@ and momentum shifts.`;
     messages.push({ role: 'system', content: `Memory: ${characterFacts}` });
   }
   chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
-  messages.push({ role: 'user', content: message });
 
   try {
-    const response = await axios.post(MISTRAL_URL, {
-      model: MODEL_NAME,
-      messages,
-      max_tokens: 250,
-      temperature: 0.8
-    }, {
-      headers: {
-        'Authorization': `Bearer ${MISTRAL_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const botReply = response.data.choices[0].message.content.trim();
+    const botReply = await mistral.chat(messages);
     await storeMessage(user_id, botReply, 'assistant');
 
     // Memory update logic (simple)
@@ -372,20 +353,28 @@ and momentum shifts.`;
 
     res.json({ response: botReply });
   } catch (error) {
-    res.status(500).json({ error: 'Mistral API error', details: error.response?.data || error.message });
+    const details = describeMistralError(error);
+    console.error(`Mistral API request failed: ${details}`);
+    res.status(500).json({ error: 'Mistral API error', details });
   }
 });
 
-initDb()
-  .then(() => {
-    const port = process.env.PORT || 8080;
-    const server = app.listen(port, '0.0.0.0', () => {
-      console.log(`Wrestling bot API running on port ${port}`);
+// Start listening only when run directly (node wrestling.js / npm start).
+// Tests import the app and manage their own server instead.
+if (require.main === module) {
+  initDb()
+    .then(() => {
+      const port = process.env.PORT || 8080;
+      const server = app.listen(port, '0.0.0.0', () => {
+        console.log(`Wrestling bot API running on port ${port}`);
+      });
+      server.keepAliveTimeout = 61000;
+      server.headersTimeout = 62000;
+    })
+    .catch((error) => {
+      console.error('Failed to connect to MongoDB:', error.message);
+      process.exit(1);
     });
-    server.keepAliveTimeout = 61000;
-    server.headersTimeout = 62000;
-  })
-  .catch((error) => {
-    console.error('Failed to connect to MongoDB:', error.message);
-    process.exit(1);
-  });
+}
+
+module.exports = { app };

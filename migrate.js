@@ -14,13 +14,14 @@
  *   node migrate.js path/to/wrestling_bot.db --url "mongodb://user:pass@host:27017"
  *   node migrate.js --from-mysql "mysql://user:pass@host:3306/railway" --url "mongodb://…"
  *
- * Everything ends up in each user's own memory folder — a per-user MongoDB
- * collection (memory_r_<user_id>, memory_b_<…>, or memory_h_<…>) holding one
- * memory file:
- *   { _id: <user_id>, chats: [...], matches: [...], key_facts: [...], character_facts: "…" }
+ * Everything ends up in each user's own memory folders — TWO per-user MongoDB
+ * collections each holding one memory file:
+ *   <base>_chats → { _id: <user_id>, chats: [...] }
+ *   <base>_facts → { _id: <user_id>, character_facts: "…", matches: [...], key_facts: [...] }
+ * where <base> is memory_r_<user_id>, memory_b_<…>, or memory_h_<…>.
  *
- * Users still living in the old flat `memory` collection are moved into their
- * own folders first. Idempotent: chats already present in a memory file (from a
+ * Users still living in the old flat `memory` collection are split into their
+ * own folders first. Idempotent: chats already present in a chats file (from a
  * previous run or from the app itself) are detected and skipped, so running it
  * twice is safe.
  *
@@ -31,7 +32,13 @@
 const fs = require('fs');
 const path = require('path');
 const { MongoClient } = require('mongodb');
-const { collectionNameForUser, isUserFolderName } = require('./memoryFolders');
+const {
+  chatFolderNameForUser,
+  factsFolderNameForUser,
+  isUserFolderName,
+  isChatFolderName,
+  isFactsFolderName
+} = require('./memoryFolders');
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -287,20 +294,69 @@ async function main() {
     await client.connect();
     const database = client.db(DB_NAME);
 
-    // Each user's memory folder (their own collection). `createIndex` also
-    // creates the collection on first use, so a new user gets their folder here.
+    // Each user's typed memory folders. `createIndex` also creates the
+    // collection on first use, so a new user gets their folders here.
     const indexedFolders = new Set();
-    async function ensureFolder(userId) {
-      const folder = database.collection(collectionNameForUser(userId));
-      const name = folder.collectionName;
+    async function ensureFolderByName(name) {
+      const folder = database.collection(name);
       if (!indexedFolders.has(name)) {
         await folder.createIndex({ user_id: 1 });
         indexedFolders.add(name);
       }
       return folder;
     }
+    const ensureChatFolder = userId => ensureFolderByName(chatFolderNameForUser(userId));
+    const ensureFactsFolder = userId => ensureFolderByName(factsFolderNameForUser(userId));
 
-    // ---- move users from the old flat `memory` collection into folders ----
+    // Splits one old-style memory file (chats and/or facts in a single
+    // document) into the user's typed folders, never overwriting files that
+    // already exist. Returns true when something was written.
+    async function splitLegacyFile(doc) {
+      const legacyUserId = doc.user_id != null
+        ? String(doc.user_id)
+        : (doc._id != null ? String(doc._id) : '');
+      if (!legacyUserId) return false;
+
+      const now = new Date();
+      let migrated = false;
+
+      const chats = Array.isArray(doc.chats) ? doc.chats : [];
+      if (chats.length) {
+        const chatFolder = await ensureChatFolder(legacyUserId);
+        if (!(await chatFolder.findOne({ _id: legacyUserId }))) {
+          await chatFolder.insertOne({
+            _id: legacyUserId,
+            user_id: legacyUserId,
+            chats,
+            created_at: doc.created_at || now,
+            updated_at: doc.updated_at || now
+          });
+          migrated = true;
+        }
+      }
+
+      const hasFacts =
+        doc.character_facts != null || Array.isArray(doc.matches) || Array.isArray(doc.key_facts);
+      if (hasFacts) {
+        const factsFolder = await ensureFactsFolder(legacyUserId);
+        if (!(await factsFolder.findOne({ _id: legacyUserId }))) {
+          await factsFolder.insertOne({
+            _id: legacyUserId,
+            user_id: legacyUserId,
+            character_facts: doc.character_facts != null ? String(doc.character_facts) : '',
+            matches: Array.isArray(doc.matches) ? doc.matches : [],
+            key_facts: Array.isArray(doc.key_facts) ? doc.key_facts : [],
+            created_at: doc.created_at || now,
+            updated_at: doc.updated_at || now
+          });
+          migrated = true;
+        }
+      }
+
+      return migrated;
+    }
+
+    // ---- split users out of the old flat `memory` collection into folders ----
     let legacyMigrated = 0;
     let legacySkipped = 0;
     let legacyFound = false;
@@ -314,21 +370,8 @@ async function main() {
       const legacyCursor = legacy.find({});
       while (await legacyCursor.hasNext()) {
         const doc = await legacyCursor.next();
-        const legacyUserId = doc.user_id != null
-          ? String(doc.user_id)
-          : (doc._id != null ? String(doc._id) : '');
-        if (!legacyUserId) {
-          legacySkipped += 1;
-          continue;
-        }
-        const folder = await ensureFolder(legacyUserId);
-        const alreadyThere = await folder.findOne({ _id: legacyUserId });
-        if (alreadyThere) {
-          legacySkipped += 1;
-          continue;
-        }
-        await folder.insertOne({ ...doc, _id: legacyUserId, user_id: legacyUserId });
-        legacyMigrated += 1;
+        if (await splitLegacyFile(doc)) legacyMigrated += 1;
+        else legacySkipped += 1;
       }
     }
 
@@ -364,22 +407,26 @@ async function main() {
       userEntry(userId).characterFacts = row.character_facts == null ? '' : String(row.character_facts);
     }
 
-    // ---- merge into the memory files ----
+    // ---- merge into the memory files (chats → chats folder, facts → facts folder) ----
     let insertedChats = 0;
     let skippedChats = 0;
     let trimmedChats = 0;
-    let newFiles = 0;
-    let updatedFiles = 0;
+    let newChatFiles = 0;
+    let updatedChatFiles = 0;
+    let newFactFiles = 0;
+    let updatedFactFiles = 0;
     let factsWritten = 0;
     let factsKept = 0;
 
     for (const [userId, entry] of users) {
-      const folder = await ensureFolder(userId);
-      const existing = await folder.findOne({ _id: userId });
       const now = new Date();
 
+      // ---- chats file ----
+      const chatFolder = await ensureChatFolder(userId);
+      const existingChatFile = await chatFolder.findOne({ _id: userId });
+
       // chats — keep what is already there, add only the missing ones
-      const existingChats = (existing && Array.isArray(existing.chats) ? existing.chats : []).map(chat => ({
+      const existingChats = (existingChatFile && Array.isArray(existingChatFile.chats) ? existingChatFile.chats : []).map(chat => ({
         role: chat.role == null ? '' : String(chat.role),
         message: chat.message == null ? '' : String(chat.message),
         timestamp: chat.timestamp instanceof Date ? chat.timestamp : normalizeTimestamp(chat.timestamp)
@@ -413,8 +460,29 @@ async function main() {
         mergedChats = mergedChats.slice(-CHAT_LIMIT);
       }
 
+      // Skip writing an empty chats file for users that only have facts.
+      if (mergedChats.length || existingChatFile) {
+        await chatFolder.updateOne(
+          { _id: userId },
+          {
+            $setOnInsert: { user_id: userId, created_at: now },
+            $set: { chats: mergedChats, updated_at: now }
+          },
+          { upsert: true }
+        );
+        if (existingChatFile) updatedChatFiles += 1;
+        else newChatFiles += 1;
+      }
+      insertedChats += toAdd.length;
+
+      // ---- facts file ----
+      const factsFolder = await ensureFactsFolder(userId);
+      const existingFactFile = await factsFolder.findOne({ _id: userId });
+
       // character facts — never overwrite what the app already stored
-      const existingFacts = existing && existing.character_facts != null ? String(existing.character_facts) : '';
+      const existingFacts = existingFactFile && existingFactFile.character_facts != null
+        ? String(existingFactFile.character_facts)
+        : '';
       let characterFacts = existingFacts;
       if (entry.characterFacts) {
         if (existingFacts) factsKept += 1;
@@ -426,8 +494,8 @@ async function main() {
 
       // matches / key facts — rebuilt from the memory string
       const parsed = parseFactEntries(characterFacts);
-      const existingMatches = existing && Array.isArray(existing.matches) ? existing.matches : [];
-      const existingKeyFacts = existing && Array.isArray(existing.key_facts) ? existing.key_facts : [];
+      const existingMatches = existingFactFile && Array.isArray(existingFactFile.matches) ? existingFactFile.matches : [];
+      const existingKeyFacts = existingFactFile && Array.isArray(existingFactFile.key_facts) ? existingFactFile.key_facts : [];
       const knownMatches = new Set(existingMatches.map(m => (m && m.text != null ? String(m.text) : '')));
       const knownKeyFacts = new Set(existingKeyFacts.map(m => (m && m.text != null ? String(m.text) : '')));
 
@@ -438,24 +506,24 @@ async function main() {
         parsed.keyFacts.filter(text => !knownKeyFacts.has(text)).map(text => ({ text, timestamp: now }))
       ).slice(-FACT_LIMIT);
 
-      await folder.updateOne(
-        { _id: userId },
-        {
-          $setOnInsert: { user_id: userId, created_at: now },
-          $set: {
-            chats: mergedChats,
-            matches,
-            key_facts: keyFacts,
-            character_facts: characterFacts,
-            updated_at: now
-          }
-        },
-        { upsert: true }
-      );
-
-      insertedChats += toAdd.length;
-      if (existing) updatedFiles += 1;
-      else newFiles += 1;
+      // Skip writing an empty facts file for users that only have chats.
+      if (characterFacts || matches.length || keyFacts.length || existingFactFile) {
+        await factsFolder.updateOne(
+          { _id: userId },
+          {
+            $setOnInsert: { user_id: userId, created_at: now },
+            $set: {
+              matches,
+              key_facts: keyFacts,
+              character_facts: characterFacts,
+              updated_at: now
+            }
+          },
+          { upsert: true }
+        );
+        if (existingFactFile) updatedFactFiles += 1;
+        else newFactFiles += 1;
+      }
     }
 
     console.log(
@@ -467,49 +535,51 @@ async function main() {
       `character facts: ${source.memory.length} read, ${factsWritten} written, ${factsKept} left untouched (already in MongoDB)` +
       (memBadUsers ? `, ${memBadUsers} skipped (empty user_id)` : '')
     );
-    console.log(`memory files: ${newFiles} created, ${updatedFiles} updated`);
+    console.log(
+      `memory files: ${newChatFiles} chats file(s) created, ${updatedChatFiles} updated — ` +
+      `${newFactFiles} facts file(s) created, ${updatedFactFiles} updated`
+    );
     if (legacyFound) {
       console.log(
-        `legacy "memory" collection: ${legacyMigrated} user(s) moved into their own folder, ` +
-        `${legacySkipped} already in place`
+        `legacy "memory" collection: ${legacyMigrated} memory file(s) split into chats/facts folders, ` +
+        `${legacySkipped} skipped (already in place or empty)`
       );
     }
 
-    // ---- verification (summed across every user's folder) ----
-    const folderNames = [];
+    // ---- verification (summed across the typed user folders) ----
+    const chatFolderNames = [];
+    const factsFolderNames = [];
+    let legacyCombined = 0;
     const folderCursor = database.listCollections({}, { nameOnly: true });
     while (await folderCursor.hasNext()) {
       const { name } = await folderCursor.next();
-      if (isUserFolderName(name)) folderNames.push(name);
+      if (!isUserFolderName(name)) continue;
+      if (isChatFolderName(name)) chatFolderNames.push(name);
+      else if (isFactsFolderName(name)) factsFolderNames.push(name);
+      else legacyCombined += 1;
     }
 
-    let fileCount = 0;
-    let totalChats = 0;
-    let totalMatches = 0;
-    let totalKeyFacts = 0;
-    for (const name of folderNames) {
-      const folder = database.collection(name);
-      fileCount += await folder.countDocuments();
-      const [totals] = await folder.aggregate([
-        {
-          $group: {
-            _id: null,
-            chats: { $sum: { $size: { $ifNull: ['$chats', []] } } },
-            matches: { $sum: { $size: { $ifNull: ['$matches', []] } } },
-            keyFacts: { $sum: { $size: { $ifNull: ['$key_facts', []] } } }
-          }
-        }
-      ]).toArray();
-      if (totals) {
-        totalChats += totals.chats;
-        totalMatches += totals.matches;
-        totalKeyFacts += totals.keyFacts;
+    async function sumArrayField(names, field) {
+      let total = 0;
+      for (const name of names) {
+        const [totals] = await database.collection(name).aggregate([
+          { $group: { _id: null, n: { $sum: { $size: { $ifNull: [`$${field}`, []] } } } } }
+        ]).toArray();
+        if (totals) total += totals.n;
       }
+      return total;
     }
+
+    const totalChats = await sumArrayField(chatFolderNames, 'chats');
+    const totalMatches = await sumArrayField(factsFolderNames, 'matches');
+    const totalKeyFacts = await sumArrayField(factsFolderNames, 'key_facts');
 
     console.log(
-      `\nVerification — ${DB_NAME} now holds ${folderNames.length} user folder(s) (${fileCount} memory file(s)) with ` +
-      `${totalChats} chats, ${totalMatches} matches and ${totalKeyFacts} key facts.`
+      `\nVerification — ${DB_NAME} now holds ${chatFolderNames.length} chats folder(s) with ${totalChats} chats ` +
+      `and ${factsFolderNames.length} facts folder(s) with ${totalMatches} matches and ${totalKeyFacts} key facts.` +
+      (legacyCombined
+        ? `\n${legacyCombined} old combined folder(s) still present — the app splits them into chats/facts folders automatically on startup.`
+        : '')
     );
   } catch (err) {
     console.error(`Migration failed: ${err.message}`);

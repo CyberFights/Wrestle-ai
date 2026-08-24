@@ -4,31 +4,52 @@
  * memoryStore.js — MongoDB storage layer.
  *
  * The bot keeps its memory inside a MongoDB database (the "memory folder").
- * Each user gets their OWN collection inside that database — their own folder —
- * and everything the bot remembers about that user (chats, matches, key facts,
- * character facts) is stored in, and pulled from, that folder. Inside the
- * folder everything lives in ONE document ("memory file") keyed by the user id:
+ * Each user gets TWO folders of their own (their own MongoDB collections):
  *
- *   memory_r_<user_id>  →  {
- *     _id: "<user_id>",               // the user id is the document key
- *     user_id: "<user_id>",
- *     chats:     [ { role, message, timestamp } ],   // conversation history
- *     matches:   [ { text, timestamp } ],            // matches that came up
- *     key_facts: [ { text, timestamp } ],            // notable events / facts
- *     character_facts: "…",          // the memory string fed to the model
+ *   <database>/
+ *   ├── memory_r_12345_chats   ← chat messages folder (one per user)
+ *   ├── memory_r_12345_facts   ← character facts folder (one per user)
+ *   ├── memory_r_67890_chats
+ *   ├── memory_r_67890_facts
+ *   └── …
+ *
+ * Every folder holds ONE "memory file" — a single document keyed by the
+ * user id:
+ *
+ *   <base>_chats → {
+ *     _id: "<user_id>", user_id: "<user_id>",
+ *     chats: [ { role, message, timestamp } ],   // conversation history
  *     created_at, updated_at
  *   }
  *
- * A folder is created automatically the first time a new user shows up. On
- * startup, any users still living in the old flat `memory` collection are moved
- * into their own folders, so nothing is lost when upgrading.
+ *   <base>_facts → {
+ *     _id: "<user_id>", user_id: "<user_id>",
+ *     character_facts: "…",      // the memory string fed to the model
+ *     matches:    [ { text, timestamp } ],   // matches that came up
+ *     key_facts:  [ { text, timestamp } ],   // notable events / facts
+ *     created_at, updated_at
+ *   }
+ *
+ * Folders are created automatically the first time anything is stored or read
+ * for a user. Only the last 10 chats are ever sent to the model
+ * (getLastMessages default), even though the file keeps more.
+ *
+ * On startup, data still living in older layouts is split into the two
+ * folders automatically: the old flat `memory` collection, and the previous
+ * single-folder layout (<base> holding chats and facts in one file). The
+ * migration is idempotent and never deletes the originals, so restarting and
+ * upgrading is always safe.
  *
  * Railway injects MONGO_URL automatically when a MongoDB database is attached
  * to the service.
  */
 
 const { MongoClient } = require('mongodb');
-const { collectionNameForUser, isUserFolderName } = require('./memoryFolders');
+const {
+  chatFolderNameForUser,
+  factsFolderNameForUser,
+  isUserFolderName
+} = require('./memoryFolders');
 
 const MONGO_URL =
   process.env.MONGO_URL ||
@@ -67,6 +88,9 @@ function dbNameFromUrl(url) {
 const CHAT_LIMIT = toPositiveInt(process.env.MEMORY_CHAT_LIMIT, 2000);
 const FACT_LIMIT = toPositiveInt(process.env.MEMORY_FACT_LIMIT, 500);
 
+// Only this many most-recent chats are ever sent to the model.
+const MODEL_HISTORY_LIMIT = toPositiveInt(process.env.MODEL_HISTORY_LIMIT, 10);
+
 function toPositiveInt(value, fallback) {
   const n = parseInt(value, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -80,17 +104,16 @@ const client = new MongoClient(MONGO_URL, {
 
 let db = null;
 
-// Collection names whose folder has already been created + indexed this run.
+// Folder names whose collection has already been created + indexed this run.
 const knownFolders = new Set();
 
 function isNamespaceExistsError(err) {
   return Boolean(err) && (err.code === 48 || err.codeName === 'NamespaceExists');
 }
 
-// Returns (creating it on first use) the user's own memory folder collection.
-async function ensureUserFolder(userId) {
+// Returns (creating it on first use) the given folder collection.
+async function ensureFolder(name) {
   if (!db) throw new Error('MongoDB is not connected yet — call initDb() first');
-  const name = collectionNameForUser(userId);
 
   if (!knownFolders.has(name)) {
     const exists = await db.listCollections({ name }, { nameOnly: true }).hasNext();
@@ -109,17 +132,28 @@ async function ensureUserFolder(userId) {
   return db.collection(name);
 }
 
+// The user's chat messages folder:  <base>_chats
+function ensureChatFolder(userId) {
+  return ensureFolder(chatFolderNameForUser(userId));
+}
+
+// The user's character facts folder:  <base>_facts
+function ensureFactsFolder(userId) {
+  return ensureFolder(factsFolderNameForUser(userId));
+}
+
 async function initDb() {
   await client.connect();
   db = client.db(DB_NAME);
 
-  // Move any users still stored in the old flat collection into their own
-  // folders. Idempotent: folders that already have the user are left alone.
+  // Move any data still stored in older layouts (the flat `memory` collection
+  // and the combined single folders) into the chats/facts folder pair.
+  // Idempotent: files that already exist in the typed folders are left alone.
   const legacy = await migrateLegacyMemory();
-  if (legacy.found) {
+  if (legacy.migrated > 0) {
     console.log(
-      `Memory folders: ${legacy.migrated} user(s) moved from the legacy "${COLLECTION_NAME}" ` +
-      `collection, ${legacy.skipped} already in their own folder.`
+      `Memory folders: ${legacy.migrated} legacy memory file(s) split into separate ` +
+      `chats/facts folders (the originals were left untouched).`
     );
   }
   return db;
@@ -131,49 +165,95 @@ async function closeDb() {
   await client.close();
 }
 
-// One-time, idempotent upgrade: copy documents out of the old flat `memory`
-// collection into each user's own folder.
+// Splits one old-style memory file (chats and/or facts in a single document)
+// into the user's chats folder and facts folder. A side is copied only when
+// the target file does not exist yet, so this is safe to run repeatedly and
+// never overwrites anything the app has already written.
+async function splitLegacyFile(doc) {
+  const userId = doc.user_id != null
+    ? String(doc.user_id)
+    : (doc._id != null ? String(doc._id) : '');
+  if (!userId) return { ok: false, migrated: false };
+
+  const now = new Date();
+  let migrated = false;
+
+  const chats = Array.isArray(doc.chats) ? doc.chats : [];
+  if (chats.length) {
+    const chatFolder = await ensureChatFolder(userId);
+    if (!(await chatFolder.findOne({ _id: userId }))) {
+      await chatFolder.insertOne({
+        _id: userId,
+        user_id: userId,
+        chats,
+        created_at: doc.created_at || now,
+        updated_at: doc.updated_at || now
+      });
+      migrated = true;
+    }
+  }
+
+  const hasFacts =
+    doc.character_facts != null || Array.isArray(doc.matches) || Array.isArray(doc.key_facts);
+  if (hasFacts) {
+    const factsFolder = await ensureFactsFolder(userId);
+    if (!(await factsFolder.findOne({ _id: userId }))) {
+      await factsFolder.insertOne({
+        _id: userId,
+        user_id: userId,
+        character_facts: doc.character_facts != null ? String(doc.character_facts) : '',
+        matches: Array.isArray(doc.matches) ? doc.matches : [],
+        key_facts: Array.isArray(doc.key_facts) ? doc.key_facts : [],
+        created_at: doc.created_at || now,
+        updated_at: doc.updated_at || now
+      });
+      migrated = true;
+    }
+  }
+
+  return { ok: true, migrated };
+}
+
+// One-time, idempotent upgrade: split documents out of the legacy layouts —
+// the old flat `memory` collection and the combined single per-user folders —
+// into each user's separate chats/facts folders. Typed folders that already
+// match the new layout are also scanned; splitting their files targets the
+// folder they already live in, which is a harmless no-op.
 async function migrateLegacyMemory() {
   if (!db) throw new Error('MongoDB is not connected yet — call initDb() first');
 
+  const sources = [];
   let found = false;
   try {
     found = await db.listCollections({ name: COLLECTION_NAME }, { nameOnly: true }).hasNext();
   } catch (err) {
     found = false;
   }
-  if (!found) return { found: false, migrated: 0, skipped: 0 };
+  if (found) sources.push(COLLECTION_NAME);
 
-  const legacy = db.collection(COLLECTION_NAME);
-  let migrated = 0;
-  let skipped = 0;
-
-  const cursor = legacy.find({});
-  while (await cursor.hasNext()) {
-    const doc = await cursor.next();
-    const userId = doc.user_id != null
-      ? String(doc.user_id)
-      : (doc._id != null ? String(doc._id) : '');
-    if (!userId) {
-      skipped += 1;
-      continue;
-    }
-
-    const folder = await ensureUserFolder(userId);
-    const alreadyThere = await folder.findOne({ _id: userId });
-    if (alreadyThere) {
-      skipped += 1;
-      continue;
-    }
-
-    await folder.insertOne({ ...doc, _id: userId, user_id: userId });
-    migrated += 1;
+  const folderCursor = db.listCollections({}, { nameOnly: true });
+  while (await folderCursor.hasNext()) {
+    const { name } = await folderCursor.next();
+    if (isUserFolderName(name)) sources.push(name);
   }
 
-  return { found: true, migrated, skipped };
+  let migrated = 0;
+  let skipped = 0;
+  for (const name of sources) {
+    const cursor = db.collection(name).find({});
+    while (await cursor.hasNext()) {
+      const doc = await cursor.next();
+      const result = await splitLegacyFile(doc);
+      if (!result.ok) skipped += 1;
+      else if (result.migrated) migrated += 1;
+    }
+  }
+
+  return { found, migrated, skipped };
 }
 
-// Names of every per-user memory folder currently in the database.
+// Names of every per-user memory folder currently in the database (typed
+// ..._chats / ..._facts folders and any old untyped single folders).
 async function listUserFolders() {
   if (!db) throw new Error('MongoDB is not connected yet — call initDb() first');
   const folders = [];
@@ -185,20 +265,17 @@ async function listUserFolders() {
   return folders.sort();
 }
 
-// ---------- CHATS ----------
+// ---------- CHATS (the user's chats folder) ----------
 
 async function storeMessage(userId, message, role) {
   const id = String(userId);
   const now = new Date();
-  const folder = await ensureUserFolder(id);
+  const folder = await ensureChatFolder(id);
   await folder.updateOne(
     { _id: id },
     {
       $setOnInsert: {
         user_id: id,
-        character_facts: '',
-        matches: [],
-        key_facts: [],
         created_at: now
       },
       $set: { updated_at: now },
@@ -213,10 +290,12 @@ async function storeMessage(userId, message, role) {
   );
 }
 
-async function getLastMessages(userId, limit = 10) {
-  const safeLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+// The most recent chats — this is ALL that is ever sent to the model
+// (10 by default; see MODEL_HISTORY_LIMIT in memoryStore / wrestling.js).
+async function getLastMessages(userId, limit = MODEL_HISTORY_LIMIT) {
+  const safeLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || MODEL_HISTORY_LIMIT));
   const id = String(userId);
-  const folder = await ensureUserFolder(id);
+  const folder = await ensureChatFolder(id);
   const doc = await folder.findOne(
     { _id: id },
     { projection: { chats: { $slice: -safeLimit } } }
@@ -225,11 +304,11 @@ async function getLastMessages(userId, limit = 10) {
   return chats.map(chat => ({ role: chat.role, content: chat.message }));
 }
 
-// ---------- MATCHES + KEY FACTS ----------
+// ---------- CHARACTER FACTS (the user's facts folder) ----------
 
 // The app builds its memory string by appending segments like
 //   " | New match discussed: <message>"  and  " | Notable event: <message>".
-// Those segments are split back out here so the memory file also keeps them as
+// Those segments are split back out here so the facts file also keeps them as
 // structured `matches` / `key_facts` lists.
 const FACT_MARKER = /\s*\|\s*(New match discussed|Notable event):\s*/g;
 
@@ -258,7 +337,7 @@ function parseFactEntries(text) {
 
 async function getCharacterFacts(userId) {
   const id = String(userId);
-  const folder = await ensureUserFolder(id);
+  const folder = await ensureFactsFolder(id);
   const doc = await folder.findOne(
     { _id: id },
     { projection: { character_facts: 1 } }
@@ -278,7 +357,7 @@ async function updateCharacterFacts(userId, facts) {
     : nextFacts;
   const { matches, keyFacts } = parseFactEntries(delta);
 
-  const setOnInsert = { user_id: id, chats: [], created_at: now };
+  const setOnInsert = { user_id: id, created_at: now };
   const push = {};
 
   if (matches.length) {
@@ -305,7 +384,7 @@ async function updateCharacterFacts(userId, facts) {
   };
   if (Object.keys(push).length) update.$push = push;
 
-  const folder = await ensureUserFolder(id);
+  const folder = await ensureFactsFolder(id);
   await folder.updateOne({ _id: id }, update, { upsert: true });
 }
 
@@ -316,7 +395,8 @@ module.exports = {
   getLastMessages,
   getCharacterFacts,
   updateCharacterFacts,
-  ensureUserFolder,
+  ensureChatFolder,
+  ensureFactsFolder,
   migrateLegacyMemory,
   listUserFolders,
   parseFactEntries,
@@ -324,5 +404,6 @@ module.exports = {
   DB_NAME,
   COLLECTION_NAME,
   CHAT_LIMIT,
-  FACT_LIMIT
+  FACT_LIMIT,
+  MODEL_HISTORY_LIMIT
 };

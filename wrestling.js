@@ -23,6 +23,24 @@ const mistral = createMistralClient({ apiKey: MISTRAL_API_KEY });
 const app = express();
 app.use(bodyParser.json());
 
+// body-parser forwards invalid JSON to Express as an error before a route is
+// reached. Without an error handler Express's default handler prints the full
+// SyntaxError stack for every bad request, which both floods production logs
+// and gives API callers an HTML response. Keep malformed client payloads as a
+// normal 400 response instead. We deliberately do not try to "repair" the
+// body: arbitrary prompt/message text makes that ambiguous and unsafe. Callers
+// must serialize request objects with JSON.stringify (or their HTTP library's
+// `json` option), rather than interpolating text into a JSON string.
+app.use((error, req, res, next) => {
+  if (error?.type !== 'entity.parse.failed') return next(error);
+
+  console.warn(`Rejected malformed JSON: ${req.method} ${req.originalUrl}`);
+  return res.status(400).json({
+    error: 'Invalid JSON body.',
+    details: 'Serialize the complete request object as JSON; do not concatenate message or system_p text into JSON.'
+  });
+});
+
 // ---------- DAMAGE ENGINE HELPERS ----------
 
 function clamp(value, min = 0, max = 100) {

@@ -37,6 +37,31 @@ that is what the endpoints log and return in the `details` field of an error res
 
 Run the tests with `npm test` (stubbed Mistral server, no real API key needed).
 
+## Sending requests
+
+Always let a JSON serializer encode the **complete** request object. In particular, do not
+interpolate `message` or `system_p` into a hand-built JSON string: prompts commonly contain
+quotes and newlines, which make that string invalid and cause `Unexpected token ... in JSON`
+errors before the request reaches either route.
+
+```js
+await fetch(`${apiUrl}/wrestling_bot`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    user_id: userId,
+    message,
+    system_p: systemPrompt,
+    in_battle: true,
+    stats
+  })
+});
+```
+
+Malformed request bodies receive a JSON `400` response with `error: "Invalid JSON body."`.
+The server does not guess how to repair invalid JSON, because arbitrary prompt text makes
+that lossy and ambiguous.
+
 ## How memory is stored
 
 The bot's memory lives in the MongoDB database (the "memory folder"). Inside it, **every

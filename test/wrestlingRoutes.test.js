@@ -75,7 +75,7 @@ const mistralStub = http.createServer((req, res) => {
 
 // ---------- helpers ----------
 
-function request(method, path, body) {
+function requestRaw(method, path, rawBody) {
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: '127.0.0.1', port: PORT, path, method, headers: { 'Content-Type': 'application/json' } },
@@ -90,8 +90,12 @@ function request(method, path, body) {
       }
     );
     req.on('error', reject);
-    req.end(body == null ? undefined : JSON.stringify(body));
+    req.end(rawBody);
   });
+}
+
+function request(method, path, body) {
+  return requestRaw(method, path, body == null ? undefined : JSON.stringify(body));
 }
 
 // ---------- boot ----------
@@ -131,6 +135,25 @@ test('GET / keeps its old "private interface" 500 guard', async () => {
   const res = await request('GET', '/');
   assert.equal(res.status, 500);
   assert.match(res.body.error, /private/i);
+});
+
+test('POST endpoints return a clean JSON 400 for malformed JSON bodies', async () => {
+  const storedBefore = calls.storeMessage.length;
+  const mistralBefore = mistralRequests.length;
+
+  // This mimics a caller interpolating prompt text containing quotes instead
+  // of passing the full object through JSON.stringify.
+  const res = await requestRaw(
+    'POST',
+    '/wrestling_bot',
+    '{"user_id":"broken","message":"I yell "your turn.""}'
+  );
+
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'Invalid JSON body.');
+  assert.match(res.body.details, /serialize/i);
+  assert.equal(calls.storeMessage.length, storedBefore, 'the malformed request must not reach the route');
+  assert.equal(mistralRequests.length, mistralBefore, 'the malformed request must not reach Mistral');
 });
 
 test('POST /wrestling_bot keeps the 400 shape on missing fields', async () => {

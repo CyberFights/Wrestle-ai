@@ -58,7 +58,50 @@ function parsePositiveInt(value, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-function logMalformedJson(req, error) {
+function extractErrorSnippet(body, error) {
+  if (!body) return null;
+  const raw = Buffer.isBuffer(body) ? body.toString('utf8') : String(body);
+  if (!raw.length) return null;
+
+  let position = -1;
+  const posMatch = error?.message?.match(/position\s+(\d+)/i);
+  if (posMatch) {
+    position = parseInt(posMatch[1], 10);
+  } else {
+    const lineColMatch = error?.message?.match(/line\s+(\d+)\s+column\s+(\d+)/i);
+    if (lineColMatch) {
+      const line = parseInt(lineColMatch[1], 10);
+      const col = parseInt(lineColMatch[2], 10);
+      const lines = raw.split('\n');
+      if (line >= 1 && line <= lines.length) {
+        let p = 0;
+        for (let i = 0; i < line - 1; i++) {
+          p += lines[i].length + 1;
+        }
+        position = p + (col - 1);
+      }
+    }
+  }
+
+  if (Number.isFinite(position) && position >= 0 && position <= raw.length) {
+    const start = Math.max(0, position - 25);
+    const end = Math.min(raw.length, position + 25);
+    const before = sanitizeLogValue(raw.slice(start, position), 30);
+    const at = sanitizeLogValue(raw.slice(position, position + 1), 5) || '?';
+    const after = sanitizeLogValue(raw.slice(position + 1, end), 30);
+    return `${start > 0 ? '...' : ''}${before}[${at}]${after}${end < raw.length ? '...' : ''}`;
+  }
+
+  const excerptMatch = error?.message?.match(/is not valid JSON/i) &&
+    error?.message?.match(/Unexpected token\s+[^,]+,\s*(.*?)\s*is not valid JSON/i);
+  if (excerptMatch && excerptMatch[1]) {
+    return sanitizeLogValue(excerptMatch[1], 80);
+  }
+
+  return sanitizeLogValue(raw.slice(0, 60), 60) + (raw.length > 60 ? '...' : '');
+}
+
+function logMalformedJson(req, error, snippet) {
   const now = Date.now();
   if (now - malformedJsonLogState.windowStart > MALFORMED_JSON_LOG_WINDOW_MS) {
     if (malformedJsonLogState.suppressed > 0) {
@@ -79,7 +122,8 @@ function logMalformedJson(req, error) {
     `request_id=${req.requestId} ip=${clientIp(req)} ` +
     `content_type=${sanitizeLogValue(req.headers['content-type'] || 'none', 80)} ` +
     `bytes=${bodyBytes || sanitizeLogValue(req.headers['content-length'] || 'unknown', 24)} ` +
-    `reason=${sanitizeLogValue(error?.message || 'parse failed')}`;
+    `reason=${sanitizeLogValue(error?.message || 'parse failed')}` +
+    (snippet ? ` snippet=${JSON.stringify(snippet)}` : '');
 
   if (malformedJsonLogState.emitted < MALFORMED_JSON_LOG_LIMIT) {
     console.warn(`Rejected malformed JSON: ${req.method} ${req.originalUrl} (${context})`);
@@ -127,11 +171,13 @@ app.use((error, req, res, next) => {
 
   if (error?.type !== 'entity.parse.failed') return next(error);
 
-  logMalformedJson(req, error);
+  const snippet = extractErrorSnippet(error?.body, error);
+  logMalformedJson(req, error, snippet);
   return res.status(400).json({
     error: 'Invalid JSON body.',
     details: 'Serialize the complete request object as JSON; do not concatenate message or system_p text into JSON. If your client cannot JSON-encode safely, send application/x-www-form-urlencoded fields instead.',
-    request_id: req.requestId
+    request_id: req.requestId,
+    ...(snippet ? { snippet } : {})
   });
 });
 

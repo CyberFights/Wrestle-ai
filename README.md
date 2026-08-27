@@ -56,11 +56,23 @@ facts do not make every Mistral call grow forever.
 ### `Rejected malformed JSON: POST /wrestling_bot`
 
 The request never reached the route or Mistral: Express rejected the HTTP body because it
-was not valid JSON. The most common cause is building JSON by string concatenation while
-`message` or `system_p` contains quotes/newlines. Use `JSON.stringify(...)` for the whole
-object, or send `application/x-www-form-urlencoded` fields as shown below. To avoid log
-floods, only the first few malformed JSON warnings per minute are printed in full; later
-ones are summarized.
+was not valid JSON. To pinpoint the issue, server warnings and HTTP 400 responses include
+a `snippet` preview showing the characters around the parse failure (with the offending
+token highlighted).
+
+Common causes include:
+- **`Unexpected token y in JSON at position ...`**:
+  - **Unescaped quotes in `system_p` or `message`**: hand-concatenating JSON strings when the
+    text contains quotes (e.g. dialogue like `Jax says "your turn"` or `"you won't win"`)
+    terminates the JSON string prematurely. The parser then encounters the raw word starting
+    with `y` outside quotes.
+  - **Unquoted booleans**: sending `"in_battle": yes` instead of `"in_battle": true` or
+    `"in_battle": "yes"`. In JSON, only `true`, `false`, and `null` are recognized literal
+    tokens; bare words like `yes` cause `Unexpected token y`.
+  - **Unquoted string interpolation**: e.g. `"message": ${message}` or `"in_battle": ${inBattle}`
+    where the variable starts with `y` or is unquoted.
+- To avoid log floods, only the first few malformed JSON warnings per minute are printed
+  in full; later ones are summarized.
 
 ## Sending requests
 
@@ -83,8 +95,9 @@ await fetch(`${apiUrl}/wrestling_bot`, {
 });
 ```
 
-Malformed request bodies receive a JSON `400` response with `error: "Invalid JSON body."`
-and a `request_id` that also appears in the `X-Request-Id` response header and server logs.
+Malformed request bodies receive a JSON `400` response with `error: "Invalid JSON body."`,
+`snippet` (showing the offending snippet around the syntax failure), and a `request_id`
+that also appears in the `X-Request-Id` response header and server logs.
 The server does not guess how to repair invalid JSON, because arbitrary prompt text makes
 that lossy and ambiguous.
 

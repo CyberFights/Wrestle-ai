@@ -167,8 +167,23 @@ test('POST endpoints return a clean JSON 400 for malformed JSON bodies', async (
   assert.match(res.body.details, /serialize/i);
   assert.equal(typeof res.body.request_id, 'string');
   assert.equal(res.headers['x-request-id'], res.body.request_id);
+  assert.equal(typeof res.body.snippet, 'string');
+  assert.ok(res.body.snippet.includes('our turn'));
   assert.equal(calls.storeMessage.length, storedBefore, 'the malformed request must not reach the route');
   assert.equal(mistralRequests.length, mistralBefore, 'the malformed request must not reach Mistral');
+});
+
+test('POST endpoints return diagnostic snippet when token y is unexpected (e.g. unquoted yes)', async () => {
+  const res = await requestRaw(
+    'POST',
+    '/wrestling_bot',
+    '{"user_id":"u1","in_battle":yes,"message":"hello"}'
+  );
+
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'Invalid JSON body.');
+  assert.equal(typeof res.body.snippet, 'string');
+  assert.ok(res.body.snippet.includes('yes') || res.body.snippet.includes('in_battle'));
 });
 
 test('POST /wrestling_bot keeps the 400 shape on missing fields', async () => {

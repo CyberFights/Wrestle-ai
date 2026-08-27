@@ -22,11 +22,15 @@ Optional:
 - `MEMORY_FACT_LIMIT` — how many matches / key facts each facts file keeps (default `500`).
 - `MODEL_HISTORY_LIMIT` — how many of the most recent chats are sent to the model (default `10`).
   Only stored history is affected by `MEMORY_CHAT_LIMIT`; the model never sees more than this.
+- `MODEL_MEMORY_CHAR_LIMIT` — how many characters of the most recent memory facts are sent to
+  the model (default `6000`). Full memory remains stored in MongoDB.
+- `MISTRAL_MODEL` — Mistral chat model to use (default `mistral-large-latest`).
 - `MISTRAL_TIMEOUT_MS` — per-attempt timeout for Mistral API calls (default `30000`).
 - `MISTRAL_MAX_RETRIES` — how many times a failed Mistral call is retried (default `3`).
   Retries only happen for transient failures — rate limits (429) and server errors
   (5xx, e.g. the 503 Mistral returns when overloaded), plus timeouts and connection
   errors — with exponential backoff. Permanent client errors (400/401/…) fail immediately.
+- `REQUEST_BODY_LIMIT` — maximum HTTP request body size accepted by the API (default `1mb`).
 
 ## Mistral API errors
 
@@ -34,8 +38,29 @@ Calls to Mistral go through `mistralClient.js`. Never `console.error` a raw axio
 object from these calls — it contains `config.headers.Authorization`, i.e. the raw API
 key. Use `describeMistralError(error)`, which builds a short summary without any headers;
 that is what the endpoints log and return in the `details` field of an error response.
+Every response also includes an `X-Request-Id` header for correlation.
 
 Run the tests with `npm test` (stubbed Mistral server, no real API key needed).
+
+## Troubleshooting common logs
+
+### `Mistral API attempt 1 of 4 failed ... timeout of 30000ms exceeded`
+
+The server successfully received the request, but Mistral did not answer within
+`MISTRAL_TIMEOUT_MS` for that attempt. The client retries transient failures automatically.
+If this happens often, try increasing `MISTRAL_TIMEOUT_MS`, switching `MISTRAL_MODEL` to a
+faster model, or reducing how much `system_p`/memory text is sent with each request. The
+server already caps model-visible memory with `MODEL_MEMORY_CHAR_LIMIT` so old accumulated
+facts do not make every Mistral call grow forever.
+
+### `Rejected malformed JSON: POST /wrestling_bot`
+
+The request never reached the route or Mistral: Express rejected the HTTP body because it
+was not valid JSON. The most common cause is building JSON by string concatenation while
+`message` or `system_p` contains quotes/newlines. Use `JSON.stringify(...)` for the whole
+object, or send `application/x-www-form-urlencoded` fields as shown below. To avoid log
+floods, only the first few malformed JSON warnings per minute are printed in full; later
+ones are summarized.
 
 ## Sending requests
 
@@ -58,9 +83,29 @@ await fetch(`${apiUrl}/wrestling_bot`, {
 });
 ```
 
-Malformed request bodies receive a JSON `400` response with `error: "Invalid JSON body."`.
+Malformed request bodies receive a JSON `400` response with `error: "Invalid JSON body."`
+and a `request_id` that also appears in the `X-Request-Id` response header and server logs.
 The server does not guess how to repair invalid JSON, because arbitrary prompt text makes
 that lossy and ambiguous.
+
+If your client cannot safely produce JSON, send form-encoded fields instead. This avoids
+having to escape quotes and newlines inside `message` or `system_p`:
+
+```js
+const body = new URLSearchParams({
+  user_id: userId,
+  message,
+  system_p: systemPrompt,
+  in_battle: 'true',
+  stats: JSON.stringify(stats)
+});
+
+await fetch(`${apiUrl}/wrestling_bot`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  body
+});
+```
 
 ## How memory is stored
 

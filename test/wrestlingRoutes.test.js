@@ -75,17 +75,17 @@ const mistralStub = http.createServer((req, res) => {
 
 // ---------- helpers ----------
 
-function requestRaw(method, path, rawBody) {
+function requestRaw(method, path, rawBody, headers = { 'Content-Type': 'application/json' }) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: '127.0.0.1', port: PORT, path, method, headers: { 'Content-Type': 'application/json' } },
+      { host: '127.0.0.1', port: PORT, path, method, headers },
       res => {
         let raw = '';
         res.on('data', chunk => { raw += chunk; });
         res.on('end', () => {
           let parsed = null;
           try { parsed = JSON.parse(raw); } catch (err) { /* leave null */ }
-          resolve({ status: res.statusCode, body: parsed });
+          resolve({ status: res.statusCode, body: parsed, headers: res.headers });
         });
       }
     );
@@ -96,6 +96,19 @@ function requestRaw(method, path, rawBody) {
 
 function request(method, path, body) {
   return requestRaw(method, path, body == null ? undefined : JSON.stringify(body));
+}
+
+function requestForm(method, path, body) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(body || {})) {
+    params.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+  }
+  return requestRaw(
+    method,
+    path,
+    params.toString(),
+    { 'Content-Type': 'application/x-www-form-urlencoded' }
+  );
 }
 
 // ---------- boot ----------
@@ -152,6 +165,8 @@ test('POST endpoints return a clean JSON 400 for malformed JSON bodies', async (
   assert.equal(res.status, 400);
   assert.equal(res.body.error, 'Invalid JSON body.');
   assert.match(res.body.details, /serialize/i);
+  assert.equal(typeof res.body.request_id, 'string');
+  assert.equal(res.headers['x-request-id'], res.body.request_id);
   assert.equal(calls.storeMessage.length, storedBefore, 'the malformed request must not reach the route');
   assert.equal(mistralRequests.length, mistralBefore, 'the malformed request must not reach Mistral');
 });
@@ -160,6 +175,29 @@ test('POST /wrestling_bot keeps the 400 shape on missing fields', async () => {
   const res = await request('POST', '/wrestling_bot', { user_id: 'route-user' });
   assert.deepEqual(res.status, 400);
   assert.deepEqual(res.body, { error: 'Missing user_id or message.' });
+});
+
+test('POST /wrestling_bot accepts form-encoded fields when JSON escaping is awkward', async () => {
+  mistralRequests.length = 0;
+  const stats = { health: 91, stamina: 87, head: 2, ribs: 3, arms: 4, legs: 5 };
+  const message = 'I shout "your turn" without throwing a strike.\nStill just talking.';
+
+  const res = await requestForm('POST', '/wrestling_bot', {
+    user_id: 'form-user',
+    message,
+    in_battle: 'false',
+    height: '72',
+    weight: '210',
+    stats
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.updated_stats, stats, 'form-encoded false must not be treated as truthy');
+  assert.equal(res.body.meta.target, null);
+  assert.equal(res.body.meta.repeated_count, 0);
+
+  const conversation = mistralRequests[mistralRequests.length - 1].body.messages.filter(m => m.role !== 'system');
+  assert.equal(conversation[conversation.length - 1].content, message);
 });
 
 test('POST /wrestling_bot success contract: response + updated_stats + meta', async () => {
@@ -230,6 +268,22 @@ test('character facts still flow into the prompt as the Memory system message', 
   const memoryMessage = lastMessages.find(m => m.role === 'system' && m.content.startsWith('Memory: '));
   assert.ok(memoryMessage, 'a Memory system message must be present');
   assert.match(memoryMessage.content, /New match discussed: that match was wild/);
+});
+
+test('long character facts are capped before sending them to Mistral', async () => {
+  mistralRequests.length = 0;
+  facts.set('long-facts-user', `old-start-${'x'.repeat(6500)}RECENT_MARKER`);
+
+  const res = await request('POST', '/wrestling_bot', { user_id: 'long-facts-user', message: 'hello again' });
+
+  assert.equal(res.status, 200);
+  const lastMessages = mistralRequests[mistralRequests.length - 1].body.messages;
+  const memoryMessage = lastMessages.find(m => m.role === 'system' && m.content.startsWith('Memory: '));
+  assert.ok(memoryMessage, 'a Memory system message must be present');
+  assert.ok(memoryMessage.content.includes('Earlier memory omitted'));
+  assert.ok(memoryMessage.content.includes('RECENT_MARKER'), 'recent facts should be preserved');
+  assert.ok(!memoryMessage.content.includes('old-start-'), 'oldest facts should be omitted');
+  assert.ok(memoryMessage.content.length < 6200, 'model-visible memory stays bounded');
 });
 
 test('POST /wrestling_chat success contract is unchanged', async () => {

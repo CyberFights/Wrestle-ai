@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const express = require('express');
 const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
+const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
 const {
   initDb,
@@ -321,6 +322,26 @@ function parseBoolean(value) {
   return Boolean(value);
 }
 
+// The local humanizer is on by default. An explicit request value wins over
+// the server setting so API clients can preserve raw model wording when they
+// need it (for example, when rendering a quoted transcript).
+function parseOptionalBoolean(value, fallback) {
+  if (value == null) return fallback;
+  if (typeof value === 'string' && !value.trim()) return fallback;
+  if (typeof value === 'boolean' || typeof value === 'number') return parseBoolean(value);
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
+function shouldHumanizeResponse(requestValue) {
+  const configured = parseOptionalBoolean(process.env.RESPONSE_HUMANIZER_ENABLED, true);
+  return parseOptionalBoolean(requestValue, configured);
+}
+
 function parseObject(value, fallback = {}) {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
   if (typeof value === 'string' && value.trim()) {
@@ -382,12 +403,14 @@ app.post('/wrestling_bot', async (req, res) => {
     weight,
     stats,
     previous_target,
-    repeated_count
+    repeated_count,
+    humanize
   } = req.body;
 
   const userId = asString(user_id);
   const userMessage = asString(message);
   const systemPrompt = asString(system_p);
+  const humanizeReply = shouldHumanizeResponse(humanize);
 
   if (!userId || !userMessage) {
     return res.status(400).json({ error: 'Missing user_id or message.' });
@@ -484,7 +507,10 @@ ${inBattle ? '\n' + damageStateText : ''}`;
   chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
   try {
     const rawReply = await mistral.chat(messages);
-    const botReply = sanitizeMoveOutput(rawReply, updatedStats.stamina);
+    // Humanize before the move sanitizer so the existing stamina / ending rules
+    // remain authoritative for battle responses.
+    const humanizedReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
+    const botReply = sanitizeMoveOutput(humanizedReply, updatedStats.stamina);
 
     // Store assistant reply
     await storeMessage(userId, botReply, 'assistant');
@@ -523,10 +549,11 @@ ${inBattle ? '\n' + damageStateText : ''}`;
 });
 
 app.post('/wrestling_chat', async (req, res) => {
-  const { user_id, message, system_p } = req.body;
+  const { user_id, message, system_p, humanize } = req.body;
   const userId = asString(user_id);
   const userMessage = asString(message);
   const systemPrompt = asString(system_p);
+  const humanizeReply = shouldHumanizeResponse(humanize);
 
   if (!userId || !userMessage) return res.status(400).json({ error: 'Missing user_id or message.' });
   const SYSTEM_PROMPT = systemPrompt && systemPrompt.trim().length
@@ -580,7 +607,8 @@ and momentum shifts.`;
   chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
 
   try {
-    const botReply = await mistral.chat(messages);
+    const rawReply = await mistral.chat(messages);
+    const botReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
     await storeMessage(userId, botReply, 'assistant');
 
     // Memory update logic (simple)

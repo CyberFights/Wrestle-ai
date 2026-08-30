@@ -31,6 +31,9 @@ Optional:
   (5xx, e.g. the 503 Mistral returns when overloaded), plus timeouts and connection
   errors — with exponential backoff. Permanent client errors (400/401/…) fail immediately.
 - `REQUEST_BODY_LIMIT` — maximum HTTP request body size accepted by the API (default `1mb`).
+- `RESPONSE_HUMANIZER_ENABLED` — enable the built-in, local response humanizer (default `true`).
+  Set to `false` to return the model wording untouched by default; a request's `humanize`
+  field can still override the server default for that response.
 
 ## Mistral API errors
 
@@ -41,6 +44,20 @@ that is what the endpoints log and return in the `details` field of an error res
 Every response also includes an `X-Request-Id` header for correlation.
 
 Run the tests with `npm test` (stubbed Mistral server, no real API key needed).
+
+## Free response humanizer
+
+Both `POST /wrestling_bot` and `POST /wrestling_chat` pass successful model text through a
+small local humanizer by default. It is **free**: it has no external service, API key,
+account, network request, or per-response charge. The humanizer only makes conservative
+wording changes such as turning formal phrasing into contractions; it does not generate new
+moves, alter the response order, or take control of the opponent. URLs and inline/fenced
+code are preserved as-is.
+
+To bypass it for one response, send `humanize: false` (or `humanize: 'false'` for a
+form-encoded request). The `RESPONSE_HUMANIZER_ENABLED=false` environment variable changes
+the default for all requests. On battle responses, humanization occurs before the existing
+move/stamina sanitizer, so the existing `your turn.` and move-limit rules still apply.
 
 ## Troubleshooting common logs
 

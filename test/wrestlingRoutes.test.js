@@ -58,6 +58,7 @@ const fakeMemoryStore = {
 const mistralRequests = [];
 let stubStatus = 200;
 const STUB_REPLY = 'I stagger back, grinning. your turn.';
+let stubReply = STUB_REPLY;
 
 const mistralStub = http.createServer((req, res) => {
   let raw = '';
@@ -66,7 +67,7 @@ const mistralStub = http.createServer((req, res) => {
     mistralRequests.push({ authorization: req.headers.authorization, body: JSON.parse(raw || '{}') });
     res.writeHead(stubStatus, { 'Content-Type': 'application/json' });
     if (stubStatus === 200) {
-      res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: STUB_REPLY } }] }));
+      res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: stubReply } }] }));
     } else {
       res.end(JSON.stringify({ message: 'service unavailable' }));
     }
@@ -121,6 +122,7 @@ before(async () => {
   process.env.MISTRAL_API_KEY = API_KEY;
   process.env.MISTRAL_API_URL = `http://127.0.0.1:${mistralStub.address().port}/v1/chat/completions`;
   process.env.MISTRAL_MAX_RETRIES = '0'; // keep the failure-case test instant
+  delete process.env.RESPONSE_HUMANIZER_ENABLED; // default-on behavior is under test
 
   // Swap memoryStore for the in-memory stand-in before the app loads it.
   const originalLoad = Module._load;
@@ -314,6 +316,55 @@ test('POST /wrestling_chat success contract is unchanged', async () => {
   assert.equal(payload.temperature, 0.8);
   assert.equal(payload.model, 'mistral-large-latest');
   assert.ok(mistralRequests.length > before);
+});
+
+test('responses are humanized locally by default and callers can opt out', async () => {
+  const previousReply = stubReply;
+  stubReply = 'I am not backing down. I will grab the ropes. your turn.';
+
+  try {
+    const botRes = await request('POST', '/wrestling_bot', {
+      user_id: 'humanizer-bot-user',
+      message: 'keep talking',
+      humanize: true
+    });
+    assert.equal(botRes.status, 200);
+    assert.equal(botRes.body.response, "I'm not backing down. I'll grab the ropes. your turn.");
+
+    const chatRes = await request('POST', '/wrestling_chat', {
+      user_id: 'humanizer-chat-user',
+      message: 'keep talking'
+    });
+    assert.equal(chatRes.status, 200);
+    assert.equal(chatRes.body.response, "I'm not backing down. I'll grab the ropes. your turn.");
+
+    const rawRes = await request('POST', '/wrestling_chat', {
+      user_id: 'humanizer-raw-user',
+      message: 'keep talking',
+      humanize: false
+    });
+    assert.equal(rawRes.status, 200);
+    assert.equal(rawRes.body.response, stubReply);
+
+    process.env.RESPONSE_HUMANIZER_ENABLED = 'false';
+    const disabledByServerRes = await request('POST', '/wrestling_chat', {
+      user_id: 'humanizer-server-off-user',
+      message: 'keep talking'
+    });
+    assert.equal(disabledByServerRes.status, 200);
+    assert.equal(disabledByServerRes.body.response, stubReply);
+
+    const requestOverrideRes = await request('POST', '/wrestling_chat', {
+      user_id: 'humanizer-server-override-user',
+      message: 'keep talking',
+      humanize: true
+    });
+    assert.equal(requestOverrideRes.status, 200);
+    assert.equal(requestOverrideRes.body.response, "I'm not backing down. I'll grab the ropes. your turn.");
+  } finally {
+    delete process.env.RESPONSE_HUMANIZER_ENABLED;
+    stubReply = previousReply;
+  }
 });
 
 test('a Mistral 503 still surfaces as the same 500 error shape (and leaks no key)', async () => {

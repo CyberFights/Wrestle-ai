@@ -4,11 +4,15 @@
  * memoryStore.js — MongoDB storage layer.
  *
  * The bot keeps its memory inside a MongoDB database (the "memory folder").
- * Each user gets TWO folders of their own (their own MongoDB collections):
+ * Each user gets TWO folder PAIRS of their own (their own MongoDB
+ * collections) — one pair per endpoint, so the wrestling battle bot and the
+ * casual chat bot never share conversation context:
  *
  *   <database>/
- *   ├── memory_r_12345_chats   ← chat messages folder (one per user)
- *   ├── memory_r_12345_facts   ← character facts folder (one per user)
+ *   ├── memory_r_12345_chats         ← casual chat messages (/wrestling_chat)
+ *   ├── memory_r_12345_facts         ← casual chat character facts
+ *   ├── memory_r_12345_chats_battle  ← battle messages (/wrestling_bot)
+ *   ├── memory_r_12345_facts_battle  ← battle character facts
  *   ├── memory_r_67890_chats
  *   ├── memory_r_67890_facts
  *   └── …
@@ -48,7 +52,10 @@ const { MongoClient } = require('mongodb');
 const {
   chatFolderNameForUser,
   factsFolderNameForUser,
-  isUserFolderName
+  isUserFolderName,
+  isChatFolderName,
+  isFactsFolderName,
+  BATTLE_SCOPE
 } = require('./memoryFolders');
 
 const MONGO_URL =
@@ -132,14 +139,14 @@ async function ensureFolder(name) {
   return db.collection(name);
 }
 
-// The user's chat messages folder:  <base>_chats
-function ensureChatFolder(userId) {
-  return ensureFolder(chatFolderNameForUser(userId));
+// The user's chat messages folder for an endpoint scope:  <base>_chats[_battle]
+function ensureChatFolder(userId, scope) {
+  return ensureFolder(chatFolderNameForUser(userId, scope));
 }
 
-// The user's character facts folder:  <base>_facts
-function ensureFactsFolder(userId) {
-  return ensureFolder(factsFolderNameForUser(userId));
+// The user's character facts folder for an endpoint scope:  <base>_facts[_battle]
+function ensureFactsFolder(userId, scope) {
+  return ensureFolder(factsFolderNameForUser(userId, scope));
 }
 
 async function initDb() {
@@ -166,9 +173,11 @@ async function closeDb() {
 }
 
 // Splits one old-style memory file (chats and/or facts in a single document)
-// into the user's chats folder and facts folder. A side is copied only when
-// the target file does not exist yet, so this is safe to run repeatedly and
-// never overwrites anything the app has already written.
+// into the user's BATTLE-scoped chats and facts folders. The wrestling battle
+// bot is the original product, so its un-scoped legacy history belongs to the
+// battle persona; the casual chat bot starts with a clean slate. A side is
+// copied only when the target file does not exist yet, so this is safe to run
+// repeatedly and never overwrites anything the app has already written.
 async function splitLegacyFile(doc) {
   const userId = doc.user_id != null
     ? String(doc.user_id)
@@ -180,7 +189,7 @@ async function splitLegacyFile(doc) {
 
   const chats = Array.isArray(doc.chats) ? doc.chats : [];
   if (chats.length) {
-    const chatFolder = await ensureChatFolder(userId);
+    const chatFolder = await ensureChatFolder(userId, BATTLE_SCOPE);
     if (!(await chatFolder.findOne({ _id: userId }))) {
       await chatFolder.insertOne({
         _id: userId,
@@ -196,7 +205,7 @@ async function splitLegacyFile(doc) {
   const hasFacts =
     doc.character_facts != null || Array.isArray(doc.matches) || Array.isArray(doc.key_facts);
   if (hasFacts) {
-    const factsFolder = await ensureFactsFolder(userId);
+    const factsFolder = await ensureFactsFolder(userId, BATTLE_SCOPE);
     if (!(await factsFolder.findOne({ _id: userId }))) {
       await factsFolder.insertOne({
         _id: userId,
@@ -215,10 +224,10 @@ async function splitLegacyFile(doc) {
 }
 
 // One-time, idempotent upgrade: split documents out of the legacy layouts —
-// the old flat `memory` collection and the combined single per-user folders —
-// into each user's separate chats/facts folders. Typed folders that already
-// match the new layout are also scanned; splitting their files targets the
-// folder they already live in, which is a harmless no-op.
+// the old flat `memory` collection and the old untyped single per-user
+// folders — into each user's battle-scoped chats/facts folders. Typed
+// ..._chats / ..._facts folders (either scope) are left alone: their files
+// already live in the correct scope.
 async function migrateLegacyMemory() {
   if (!db) throw new Error('MongoDB is not connected yet — call initDb() first');
 
@@ -234,7 +243,11 @@ async function migrateLegacyMemory() {
   const folderCursor = db.listCollections({}, { nameOnly: true });
   while (await folderCursor.hasNext()) {
     const { name } = await folderCursor.next();
-    if (isUserFolderName(name)) sources.push(name);
+    // Only the old untyped single folders are split; typed folders already
+    // carry a scope and must not be re-migrated into the battle scope.
+    if (isUserFolderName(name) && !isChatFolderName(name) && !isFactsFolderName(name)) {
+      sources.push(name);
+    }
   }
 
   let migrated = 0;
@@ -267,10 +280,10 @@ async function listUserFolders() {
 
 // ---------- CHATS (the user's chats folder) ----------
 
-async function storeMessage(userId, message, role) {
+async function storeMessage(userId, message, role, scope) {
   const id = String(userId);
   const now = new Date();
-  const folder = await ensureChatFolder(id);
+  const folder = await ensureChatFolder(id, scope);
   await folder.updateOne(
     { _id: id },
     {
@@ -292,10 +305,10 @@ async function storeMessage(userId, message, role) {
 
 // The most recent chats — this is ALL that is ever sent to the model
 // (10 by default; see MODEL_HISTORY_LIMIT in memoryStore / wrestling.js).
-async function getLastMessages(userId, limit = MODEL_HISTORY_LIMIT) {
+async function getLastMessages(userId, limit = MODEL_HISTORY_LIMIT, scope) {
   const safeLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || MODEL_HISTORY_LIMIT));
   const id = String(userId);
-  const folder = await ensureChatFolder(id);
+  const folder = await ensureChatFolder(id, scope);
   const doc = await folder.findOne(
     { _id: id },
     { projection: { chats: { $slice: -safeLimit } } }
@@ -335,9 +348,9 @@ function parseFactEntries(text) {
   return { matches, keyFacts };
 }
 
-async function getCharacterFacts(userId) {
+async function getCharacterFacts(userId, scope) {
   const id = String(userId);
-  const folder = await ensureFactsFolder(id);
+  const folder = await ensureFactsFolder(id, scope);
   const doc = await folder.findOne(
     { _id: id },
     { projection: { character_facts: 1 } }
@@ -345,11 +358,11 @@ async function getCharacterFacts(userId) {
   return doc && doc.character_facts != null ? doc.character_facts : '';
 }
 
-async function updateCharacterFacts(userId, facts) {
+async function updateCharacterFacts(userId, facts, scope) {
   const id = String(userId);
   const now = new Date();
   const nextFacts = facts == null ? '' : String(facts);
-  const previousFacts = await getCharacterFacts(id);
+  const previousFacts = await getCharacterFacts(id, scope);
 
   // Only the part that was just appended becomes new matches / key facts.
   const delta = nextFacts.startsWith(previousFacts)
@@ -384,7 +397,7 @@ async function updateCharacterFacts(userId, facts) {
   };
   if (Object.keys(push).length) update.$push = push;
 
-  const folder = await ensureFactsFolder(id);
+  const folder = await ensureFactsFolder(id, scope);
   await folder.updateOne({ _id: id }, update, { upsert: true });
 }
 

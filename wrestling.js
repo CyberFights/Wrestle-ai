@@ -452,7 +452,7 @@ app.post('/wrestling_bot', async (req, res) => {
 
   const damageStateText = inBattle ? formatDamageState(updatedStats) : '';
 
-  const SYSTEM_PROMPT = systemPrompt && systemPrompt.trim().length
+  const baseSystemPrompt = systemPrompt && systemPrompt.trim().length
     ? systemPrompt
     : `You are Jax Nova — a high-energy, charismatic, slightly sarcastic male pro-wrestling persona.
 Always speak in first person, describing your sensations, reactions, and internal thoughts.
@@ -479,8 +479,14 @@ Response Format (every turn):
 3. End every turn with: "your turn."
 Tone & Style:
 Energetic first-person mix of internal thoughts + physical action. Emphasize impact, struggle,
-and momentum shifts.
-${inBattle ? '\n' + damageStateText : ''}`;
+and momentum shifts.`;
+
+  // The damage state is appended during battle even when the caller supplied a
+  // custom system_p, so the model always narrates from the opponent's current
+  // health / stamina / damage rather than a stale or missing snapshot.
+  const SYSTEM_PROMPT = inBattle
+    ? `${baseSystemPrompt}\n${damageStateText}`
+    : baseSystemPrompt;
 
   // Store user message immediately (same as wrestling_chat), scoped to the
   // battle endpoint so it never leaks into casual chat.

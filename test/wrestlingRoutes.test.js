@@ -248,6 +248,50 @@ test('POST /wrestling_bot success contract: response + updated_stats + meta', as
   assert.deepEqual(stored, ['user', 'assistant']);
 });
 
+test('battle damage state is kept in the system prompt even with a custom system_p', async () => {
+  mistralRequests.length = 0;
+
+  const res = await request('POST', '/wrestling_bot', {
+    user_id: 'custom-sp-user',
+    message: 'I punch your jaw',
+    system_p: 'Custom battle persona instructions.',
+    in_battle: true,
+    stats: { health: 100, stamina: 100, head: 0, ribs: 0, arms: 0, legs: 0 },
+    previous_target: null,
+    repeated_count: 0
+  });
+
+  assert.equal(res.status, 200);
+  const payload = mistralRequests[mistralRequests.length - 1].body;
+  const systemPrompt = payload.messages.find(
+    m => m.role === 'system' && !m.content.startsWith('Memory: ')
+  );
+
+  assert.match(systemPrompt.content, /Custom battle persona instructions\./);
+  assert.ok(!systemPrompt.content.includes('pro-wrestling persona'), 'custom prompt must replace the default');
+  assert.match(systemPrompt.content, /Current Damage State:/);
+  assert.match(systemPrompt.content, /Health: 95%/);
+  assert.match(systemPrompt.content, /Head Damage: 8%/);
+});
+
+test('damage state is omitted when not in battle even with a custom system_p', async () => {
+  mistralRequests.length = 0;
+
+  const res = await request('POST', '/wrestling_bot', {
+    user_id: 'custom-sp-no-battle-user',
+    message: 'hello there',
+    system_p: 'Custom battle persona instructions.',
+    in_battle: false
+  });
+
+  assert.equal(res.status, 200);
+  const payload = mistralRequests[mistralRequests.length - 1].body;
+  const systemPrompt = payload.messages.find(
+    m => m.role === 'system' && !m.content.startsWith('Memory: ')
+  );
+  assert.equal(systemPrompt.content, 'Custom battle persona instructions.');
+});
+
 test('the model only ever receives the 10 most recent messages, each exactly once', async () => {
   mistralRequests.length = 0;
   calls.getLastMessages.length = 0;

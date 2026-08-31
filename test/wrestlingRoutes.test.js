@@ -27,29 +27,35 @@ const API_KEY = 'route-test-key';
 
 // ---------- in-memory memoryStore stand-in (same API as memoryStore.js) ----------
 
-const chats = new Map(); // user_id → [{ role, content }]
-const facts = new Map(); // user_id → string
+const chats = new Map(); // `${userId}|${scope}` → [{ role, content }]
+const facts = new Map(); // `${userId}|${scope}` → string
 const calls = { storeMessage: [], getLastMessages: [] };
+
+// Keys the in-memory folders by user + endpoint scope, mirroring the real
+// memoryStore: battle and chat histories must never share a folder.
+function scopeKey(userId, scope) {
+  return `${String(userId)}|${scope}`;
+}
 
 const fakeMemoryStore = {
   MODEL_HISTORY_LIMIT: 10,
   async initDb() {},
-  async storeMessage(userId, message, role) {
-    calls.storeMessage.push({ userId: String(userId), role });
-    const id = String(userId);
+  async storeMessage(userId, message, role, scope) {
+    calls.storeMessage.push({ userId: String(userId), role, scope });
+    const id = scopeKey(userId, scope);
     if (!chats.has(id)) chats.set(id, []);
     chats.get(id).push({ role, content: message });
   },
-  async getLastMessages(userId, limit = 10) {
-    const returned = (chats.get(String(userId)) || []).slice(-limit).map(m => ({ ...m }));
-    calls.getLastMessages.push({ userId: String(userId), limit, returned });
+  async getLastMessages(userId, limit = 10, scope) {
+    const returned = (chats.get(scopeKey(userId, scope)) || []).slice(-limit).map(m => ({ ...m }));
+    calls.getLastMessages.push({ userId: String(userId), limit, scope, returned });
     return returned;
   },
-  async getCharacterFacts(userId) {
-    return facts.get(String(userId)) || '';
+  async getCharacterFacts(userId, scope) {
+    return facts.get(scopeKey(userId, scope)) || '';
   },
-  async updateCharacterFacts(userId, nextFacts) {
-    facts.set(String(userId), nextFacts);
+  async updateCharacterFacts(userId, nextFacts, scope) {
+    facts.set(scopeKey(userId, scope), nextFacts);
   }
 };
 
@@ -242,6 +248,50 @@ test('POST /wrestling_bot success contract: response + updated_stats + meta', as
   assert.deepEqual(stored, ['user', 'assistant']);
 });
 
+test('battle damage state is kept in the system prompt even with a custom system_p', async () => {
+  mistralRequests.length = 0;
+
+  const res = await request('POST', '/wrestling_bot', {
+    user_id: 'custom-sp-user',
+    message: 'I punch your jaw',
+    system_p: 'Custom battle persona instructions.',
+    in_battle: true,
+    stats: { health: 100, stamina: 100, head: 0, ribs: 0, arms: 0, legs: 0 },
+    previous_target: null,
+    repeated_count: 0
+  });
+
+  assert.equal(res.status, 200);
+  const payload = mistralRequests[mistralRequests.length - 1].body;
+  const systemPrompt = payload.messages.find(
+    m => m.role === 'system' && !m.content.startsWith('Memory: ')
+  );
+
+  assert.match(systemPrompt.content, /Custom battle persona instructions\./);
+  assert.ok(!systemPrompt.content.includes('pro-wrestling persona'), 'custom prompt must replace the default');
+  assert.match(systemPrompt.content, /Current Damage State:/);
+  assert.match(systemPrompt.content, /Health: 95%/);
+  assert.match(systemPrompt.content, /Head Damage: 8%/);
+});
+
+test('damage state is omitted when not in battle even with a custom system_p', async () => {
+  mistralRequests.length = 0;
+
+  const res = await request('POST', '/wrestling_bot', {
+    user_id: 'custom-sp-no-battle-user',
+    message: 'hello there',
+    system_p: 'Custom battle persona instructions.',
+    in_battle: false
+  });
+
+  assert.equal(res.status, 200);
+  const payload = mistralRequests[mistralRequests.length - 1].body;
+  const systemPrompt = payload.messages.find(
+    m => m.role === 'system' && !m.content.startsWith('Memory: ')
+  );
+  assert.equal(systemPrompt.content, 'Custom battle persona instructions.');
+});
+
 test('the model only ever receives the 10 most recent messages, each exactly once', async () => {
   mistralRequests.length = 0;
   calls.getLastMessages.length = 0;
@@ -278,7 +328,7 @@ test('character facts still flow into the prompt as the Memory system message', 
   mistralRequests.length = 0;
 
   await request('POST', '/wrestling_bot', { user_id: 'facts-user', message: 'that match was wild' });
-  assert.ok(facts.get('facts-user').includes('New match discussed: that match was wild'));
+  assert.ok(facts.get('facts-user|battle').includes('New match discussed: that match was wild'));
 
   await request('POST', '/wrestling_bot', { user_id: 'facts-user', message: 'hello again' });
   const lastMessages = mistralRequests[mistralRequests.length - 1].body.messages;
@@ -289,7 +339,7 @@ test('character facts still flow into the prompt as the Memory system message', 
 
 test('long character facts are capped before sending them to Mistral', async () => {
   mistralRequests.length = 0;
-  facts.set('long-facts-user', `old-start-${'x'.repeat(6500)}RECENT_MARKER`);
+  facts.set('long-facts-user|battle', `old-start-${'x'.repeat(6500)}RECENT_MARKER`);
 
   const res = await request('POST', '/wrestling_bot', { user_id: 'long-facts-user', message: 'hello again' });
 
@@ -301,6 +351,37 @@ test('long character facts are capped before sending them to Mistral', async () 
   assert.ok(memoryMessage.content.includes('RECENT_MARKER'), 'recent facts should be preserved');
   assert.ok(!memoryMessage.content.includes('old-start-'), 'oldest facts should be omitted');
   assert.ok(memoryMessage.content.length < 6200, 'model-visible memory stays bounded');
+});
+
+test('casual chat is not primed by prior battle turns', async () => {
+  mistralRequests.length = 0;
+
+  // A battle turn stores wrestling-style messages for the same user…
+  await request('POST', '/wrestling_bot', {
+    user_id: 'isolation-user',
+    message: 'I slam you into the mat',
+    in_battle: true
+  });
+
+  // …then a plain chat message must reach the model with only chat context.
+  await request('POST', '/wrestling_chat', {
+    user_id: 'isolation-user',
+    message: 'hey Jax, how are you doing?'
+  });
+
+  const payload = mistralRequests[mistralRequests.length - 1].body;
+  const conversation = payload.messages.filter(m => m.role !== 'system');
+
+  assert.deepEqual(
+    conversation.map(m => m.content),
+    ['hey Jax, how are you doing?'],
+    'battle history must not leak into the casual chat context'
+  );
+
+  const systemPrompt = payload.messages.find(
+    m => m.role === 'system' && !m.content.startsWith('Memory: ')
+  );
+  assert.match(systemPrompt.content, /conversationalist/, 'chat must use the conversational persona');
 });
 
 test('POST /wrestling_chat success contract is unchanged', async () => {

@@ -140,23 +140,28 @@ await fetch(`${apiUrl}/wrestling_bot`, {
 ## How memory is stored
 
 The bot's memory lives in the MongoDB database (the "memory folder"). Inside it, **every
-user gets TWO folders of their own** — two MongoDB collections — one for chat messages
-and one for character facts:
+user gets TWO folder pairs of their own** — one pair per endpoint — so the wrestling
+battle bot and the casual chat bot keep **separate** conversation histories. This is what
+stops a `/wrestling_chat` reply from sounding like the `/wrestling_bot` battle persona
+(and vice versa):
 
 ```
-<database>/                ← the memory folder
-├── memory_r_12345_chats   ← one user's chat messages folder
-├── memory_r_12345_facts   ← the same user's character facts folder
-├── memory_r_67890_chats   ← another user's chat messages folder
-├── memory_r_67890_facts   ← another user's character facts folder
+<database>/                      ← the memory folder
+├── memory_r_12345_chats         ← chat messages via POST /wrestling_chat
+├── memory_r_12345_facts         ← character facts via POST /wrestling_chat
+├── memory_r_12345_chats_battle  ← chat messages via POST /wrestling_bot
+├── memory_r_12345_facts_battle  ← character facts via POST /wrestling_bot
+├── memory_r_67890_chats
+├── memory_r_67890_facts
 └── …
 ```
 
 Folder names are derived from the user id (`memory_r_<user_id>` for ids made of letters,
 digits, `-` and `_`; `memory_b_<base64url>` or `memory_h_<sha256>` for anything else), with
-`_chats` / `_facts` appended to pick the folder, so they are always unique per user and
-always valid in MongoDB. A new user's folders are created automatically the first time
-anything is stored or read for them.
+`_chats` / `_facts` (chat scope) or `_chats_battle` / `_facts_battle` (battle scope)
+appended to pick the folder, so they are always unique per user and always valid in
+MongoDB. A new user's folders are created automatically the first time anything is stored
+or read for them.
 
 Each folder holds **one memory file** — a single document keyed by the user id:
 
@@ -189,9 +194,11 @@ chats** (`MODEL_HISTORY_LIMIT`) are ever sent to the model, no matter how many a
 
 On startup, any data still stored in an older layout — the old flat `memory` collection or
 the previous single-folder layout (one folder per user holding chats and facts together) —
-is split into the two folders automatically. This is idempotent and never deletes the
-originals, so restarting never duplicates anything and upgrading never loses data. Once you
-are happy everything moved over, you can drop those old collections by hand.
+is split into the **battle-scoped** folder pair automatically (the wrestling battle bot is
+the original product, so the un-scoped legacy history belongs to it; the casual chat bot
+starts with a clean slate). This is idempotent and never deletes the originals, so
+restarting never duplicates anything and upgrading never loses data. Once you are happy
+everything moved over, you can drop those old collections by hand.
 
 ## Migrating your old history
 

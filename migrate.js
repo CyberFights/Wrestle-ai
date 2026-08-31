@@ -14,10 +14,10 @@
  *   node migrate.js path/to/wrestling_bot.db --url "mongodb://user:pass@host:27017"
  *   node migrate.js --from-mysql "mysql://user:pass@host:3306/railway" --url "mongodb://…"
  *
- * Everything ends up in each user's own memory folders — TWO per-user MongoDB
- * collections each holding one memory file:
- *   <base>_chats → { _id: <user_id>, chats: [...] }
- *   <base>_facts → { _id: <user_id>, character_facts: "…", matches: [...], key_facts: [...] }
+ * Everything ends up in each user's own BATTLE-scoped memory folders (the
+ * original wrestling battle bot owns this legacy history):
+ *   <base>_chats_battle → { _id: <user_id>, chats: [...] }
+ *   <base>_facts_battle → { _id: <user_id>, character_facts: "…", matches: [...], key_facts: [...] }
  * where <base> is memory_r_<user_id>, memory_b_<…>, or memory_h_<…>.
  *
  * Users still living in the old flat `memory` collection are split into their
@@ -37,7 +37,8 @@ const {
   factsFolderNameForUser,
   isUserFolderName,
   isChatFolderName,
-  isFactsFolderName
+  isFactsFolderName,
+  BATTLE_SCOPE
 } = require('./memoryFolders');
 
 // ---------------------------------------------------------------------------
@@ -305,8 +306,8 @@ async function main() {
       }
       return folder;
     }
-    const ensureChatFolder = userId => ensureFolderByName(chatFolderNameForUser(userId));
-    const ensureFactsFolder = userId => ensureFolderByName(factsFolderNameForUser(userId));
+    const ensureChatFolder = userId => ensureFolderByName(chatFolderNameForUser(userId, BATTLE_SCOPE));
+    const ensureFactsFolder = userId => ensureFolderByName(factsFolderNameForUser(userId, BATTLE_SCOPE));
 
     // Splits one old-style memory file (chats and/or facts in a single
     // document) into the user's typed folders, never overwriting files that

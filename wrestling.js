@@ -4,6 +4,7 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
+const { CHAT_SCOPE, BATTLE_SCOPE } = require('./memoryFolders');
 const {
   initDb,
   storeMessage,
@@ -451,7 +452,7 @@ app.post('/wrestling_bot', async (req, res) => {
 
   const damageStateText = inBattle ? formatDamageState(updatedStats) : '';
 
-  const SYSTEM_PROMPT = systemPrompt && systemPrompt.trim().length
+  const baseSystemPrompt = systemPrompt && systemPrompt.trim().length
     ? systemPrompt
     : `You are Jax Nova — a high-energy, charismatic, slightly sarcastic male pro-wrestling persona.
 Always speak in first person, describing your sensations, reactions, and internal thoughts.
@@ -478,12 +479,19 @@ Response Format (every turn):
 3. End every turn with: "your turn."
 Tone & Style:
 Energetic first-person mix of internal thoughts + physical action. Emphasize impact, struggle,
-and momentum shifts.
-${inBattle ? '\n' + damageStateText : ''}`;
+and momentum shifts.`;
 
-  // Store user message immediately (same as wrestling_chat)
+  // The damage state is appended during battle even when the caller supplied a
+  // custom system_p, so the model always narrates from the opponent's current
+  // health / stamina / damage rather than a stale or missing snapshot.
+  const SYSTEM_PROMPT = inBattle
+    ? `${baseSystemPrompt}\n${damageStateText}`
+    : baseSystemPrompt;
+
+  // Store user message immediately (same as wrestling_chat), scoped to the
+  // battle endpoint so it never leaks into casual chat.
   try {
-    await storeMessage(userId, userMessage, 'user');
+    await storeMessage(userId, userMessage, 'user', BATTLE_SCOPE);
   } catch (error) {
     return res.status(500).json({ error: 'Database error', details: error.message });
   }
@@ -492,8 +500,8 @@ ${inBattle ? '\n' + damageStateText : ''}`;
   // Only the 10 most recent messages (MODEL_HISTORY_LIMIT) are sent to the
   // model — and since storeMessage() above already saved the current message,
   // the history ends with it: do NOT append `message` again here.
-  const chatHistory = await getLastMessages(userId, MODEL_HISTORY_LIMIT);
-  const characterFacts = await getCharacterFacts(userId);
+  const chatHistory = await getLastMessages(userId, MODEL_HISTORY_LIMIT, BATTLE_SCOPE);
+  const characterFacts = await getCharacterFacts(userId, BATTLE_SCOPE);
 
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT }
@@ -512,8 +520,8 @@ ${inBattle ? '\n' + damageStateText : ''}`;
     const humanizedReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
     const botReply = sanitizeMoveOutput(humanizedReply, updatedStats.stamina);
 
-    // Store assistant reply
-    await storeMessage(userId, botReply, 'assistant');
+    // Store assistant reply (battle scope)
+    await storeMessage(userId, botReply, 'assistant', BATTLE_SCOPE);
 
     let updatedFacts = characterFacts;
 
@@ -526,7 +534,7 @@ ${inBattle ? '\n' + damageStateText : ''}`;
     }
 
     if (updatedFacts && updatedFacts !== characterFacts) {
-      await updateCharacterFacts(userId, updatedFacts);
+      await updateCharacterFacts(userId, updatedFacts, BATTLE_SCOPE);
     }
 
     res.json({
@@ -566,15 +574,16 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
 
 
   try {
-    await storeMessage(userId, userMessage, 'user');
+    await storeMessage(userId, userMessage, 'user', CHAT_SCOPE);
   } catch (error) {
     return res.status(500).json({ error: 'Database error', details: error.message });
   }
 
   // Only the 10 most recent messages (MODEL_HISTORY_LIMIT) are sent to the
-  // model, ending with the message just stored above.
-  const chatHistory = await getLastMessages(userId, MODEL_HISTORY_LIMIT);
-  const characterFacts = await getCharacterFacts(userId);
+  // model, ending with the message just stored above. The chat endpoint reads
+  // only its own chat-scoped history, never the battle endpoint's.
+  const chatHistory = await getLastMessages(userId, MODEL_HISTORY_LIMIT, CHAT_SCOPE);
+  const characterFacts = await getCharacterFacts(userId, CHAT_SCOPE);
 
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT }
@@ -588,7 +597,7 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
   try {
     const rawReply = await mistral.chat(messages);
     const botReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
-    await storeMessage(userId, botReply, 'assistant');
+    await storeMessage(userId, botReply, 'assistant', CHAT_SCOPE);
 
     // Memory update logic (simple)
     let updatedFacts = characterFacts;
@@ -599,7 +608,7 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
       updatedFacts += ` | Notable event: ${userMessage}`;
     }
     if (updatedFacts && updatedFacts !== characterFacts) {
-      await updateCharacterFacts(userId, updatedFacts);
+      await updateCharacterFacts(userId, updatedFacts, CHAT_SCOPE);
     }
 
     res.json({ response: botReply });

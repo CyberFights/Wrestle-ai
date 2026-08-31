@@ -20,7 +20,10 @@ const {
   isChatFolderName,
   isFactsFolderName,
   CHAT_FOLDER_SUFFIX,
-  FACTS_FOLDER_SUFFIX
+  FACTS_FOLDER_SUFFIX,
+  CHAT_SCOPE,
+  BATTLE_SCOPE,
+  BATTLE_SCOPE_SUFFIX
 } = require('../memoryFolders');
 
 const MONGO_NAME_LIMIT = 120;
@@ -101,4 +104,39 @@ test('typed names are built from the shared base', () => {
     assert.ok(isChatFolderName(chatFolderNameForUser(id)));
     assert.ok(isFactsFolderName(factsFolderNameForUser(id)));
   }
+});
+
+test('the chat scope keeps the original names; the battle scope appends a suffix', () => {
+  for (const id of ['123', 'weird:id/×', 'q'.repeat(900)]) {
+    const base = collectionNameForUser(id);
+    assert.equal(chatFolderNameForUser(id, CHAT_SCOPE), base + CHAT_FOLDER_SUFFIX);
+    assert.equal(factsFolderNameForUser(id, CHAT_SCOPE), base + FACTS_FOLDER_SUFFIX);
+    assert.equal(chatFolderNameForUser(id, BATTLE_SCOPE), base + CHAT_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX);
+    assert.equal(factsFolderNameForUser(id, BATTLE_SCOPE), base + FACTS_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX);
+    assert.ok(Buffer.byteLength(chatFolderNameForUser(id, BATTLE_SCOPE), 'utf8') <= MONGO_NAME_LIMIT);
+    assert.ok(Buffer.byteLength(factsFolderNameForUser(id, BATTLE_SCOPE), 'utf8') <= MONGO_NAME_LIMIT);
+  }
+});
+
+test('scoped folders never collide across users or endpoints', () => {
+  const names = new Set();
+  for (const id of ['alice', 'bob']) {
+    for (const scope of [CHAT_SCOPE, BATTLE_SCOPE]) {
+      const pair = [chatFolderNameForUser(id, scope), factsFolderNameForUser(id, scope)];
+      assert.notEqual(pair[0], pair[1]);
+      for (const name of pair) {
+        assert.ok(!names.has(name), `${name} would be shared`);
+        names.add(name);
+      }
+    }
+  }
+});
+
+test('name predicates classify the battle-scoped folders', () => {
+  assert.equal(isChatFolderName('memory_r_ann_chats_battle'), true);
+  assert.equal(isFactsFolderName('memory_r_ann_facts_battle'), true);
+  assert.equal(isChatFolderName('memory_r_ann_facts_battle'), false);
+  assert.equal(isFactsFolderName('memory_r_ann_chats_battle'), false);
+  assert.equal(isChatFolderName('memory_r_ann_chats'), true);
+  assert.equal(isFactsFolderName('memory_r_ann_facts'), true);
 });

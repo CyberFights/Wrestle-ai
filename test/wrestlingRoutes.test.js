@@ -9,6 +9,7 @@
  *
  * …and pins down the exact API contract the app has always had:
  *   POST /wrestling_bot  → { response, updated_stats, meta }   (+ damage math)
+ *   POST /ugcw_rp        → { response, updated_stats, meta }   (no size scaling)
  *   POST /wrestling_chat → { response }
  *   errors               → 400 / 500 shapes
  *   the model receives only the 10 most recent messages, each exactly once.
@@ -382,6 +383,91 @@ test('casual chat is not primed by prior battle turns', async () => {
     m => m.role === 'system' && !m.content.startsWith('Memory: ')
   );
   assert.match(systemPrompt.content, /conversationalist/, 'chat must use the conversational persona');
+});
+
+test('POST /ugcw_rp skips height/weight damage scaling and keeps self size in the prompt', async () => {
+  mistralRequests.length = 0;
+
+  const res = await request('POST', '/ugcw_rp', {
+    user_id: 'ugcw-user',
+    message: 'I punch your jaw',
+    in_battle: true,
+    height: 80,
+    weight: 320,
+    stats: { health: 100, stamina: 100, head: 0, ribs: 0, arms: 0, legs: 0 },
+    previous_target: null,
+    repeated_count: 0,
+    self: { health: 100, stamina: 100, trapped: false },
+    opponent: { health: 100, stamina: 100, trapped: false }
+  });
+
+  assert.equal(res.status, 200);
+  // Same unscaled strike as wrestling_bot at default size: health -5, stamina -4, head +8
+  // (80in / 320lb would have scaled wrestling_bot down.)
+  assert.deepEqual(res.body.updated_stats, { health: 95, stamina: 96, head: 8, ribs: 0, arms: 0, legs: 0 });
+  assert.equal(res.body.meta.self.trapped, false);
+  assert.equal(res.body.meta.opponent.health, 100);
+
+  const payload = mistralRequests[mistralRequests.length - 1].body;
+  const systemPrompt = payload.messages.find(
+    m => m.role === 'system' && !m.content.startsWith('Memory: ')
+  );
+  assert.match(systemPrompt.content, /Height: 80 in/);
+  assert.match(systemPrompt.content, /Weight: 320 lbs/);
+  assert.match(systemPrompt.content, /Trapped: no/);
+});
+
+test('POST /ugcw_rp health and trapped status change move result', async () => {
+  const healthy = await request('POST', '/ugcw_rp', {
+    user_id: 'ugcw-trap-user-a',
+    message: 'I punch your jaw',
+    in_battle: true,
+    height: 72,
+    weight: 210,
+    stats: { health: 100, stamina: 100, head: 0, ribs: 0, arms: 0, legs: 0 },
+    self: { health: 100, stamina: 100, trapped: false },
+    opponent: { health: 100, trapped: false }
+  });
+
+  const trapped = await request('POST', '/ugcw_rp', {
+    user_id: 'ugcw-trap-user-b',
+    message: 'I punch your jaw',
+    in_battle: true,
+    height: 72,
+    weight: 210,
+    stats: { health: 100, stamina: 100, head: 0, ribs: 0, arms: 0, legs: 0 },
+    self: { health: 20, stamina: 100, trapped: true },
+    opponent: { health: 20, trapped: false }
+  });
+
+  assert.equal(healthy.status, 200);
+  assert.equal(trapped.status, 200);
+  assert.ok(trapped.body.updated_stats.health > healthy.body.updated_stats.health,
+    'self trapped + low health should deal less damage');
+  assert.equal(trapped.body.meta.self.trapped, true);
+});
+
+test('POST /ugcw_rp history is isolated from wrestling_bot', async () => {
+  mistralRequests.length = 0;
+
+  await request('POST', '/wrestling_bot', {
+    user_id: 'ugcw-iso-user',
+    message: 'I slam you into the mat',
+    in_battle: true
+  });
+
+  await request('POST', '/ugcw_rp', {
+    user_id: 'ugcw-iso-user',
+    message: 'hey from ugcw'
+  });
+
+  const payload = mistralRequests[mistralRequests.length - 1].body;
+  const conversation = payload.messages.filter(m => m.role !== 'system');
+  assert.deepEqual(
+    conversation.map(m => m.content),
+    ['hey from ugcw'],
+    'battle history must not leak into /ugcw_rp'
+  );
 });
 
 test('POST /wrestling_chat success contract is unchanged', async () => {

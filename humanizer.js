@@ -65,19 +65,27 @@ const REWRITES = [
   { pattern: /\bwere not\b/gi, replacement: "weren't" }
 ];
 
-function humanizeSegment(text) {
+function humanizeSegment(text, options = {}) {
   let result = text;
+  const skipPhraseDrop = Boolean(options.trapped);
   for (const { pattern, replacement } of REWRITES) {
+    if (skipPhraseDrop && replacement === '') continue;
     result = result.replace(pattern, match => matchCase(match, replacement));
   }
 
   // Removing a boilerplate phrase can leave whitespace before punctuation.
-  return result.replace(/[ \t]+([,.;!?])/g, '$1');
+  result = result.replace(/[ \t]+([,.;!?])/g, '$1');
+  if (options.worn && !options.trapped) {
+    result = result.replace(/\bAdditionally,\s*/gi, 'Also, ');
+  }
+  return result;
 }
 
 function humanizeText(value, options = {}) {
   const text = value == null ? '' : String(value);
   if (!text || options?.enabled === false) return text;
+  // Trapped / worn status keeps more of the raw wording so struggle reads
+  // through; still apply contractions unless the caller opted out.
 
   let result = '';
   let cursor = 0;
@@ -85,12 +93,12 @@ function humanizeText(value, options = {}) {
   let protectedMatch;
 
   while ((protectedMatch = matcher.exec(text)) !== null) {
-    result += humanizeSegment(text.slice(cursor, protectedMatch.index));
+    result += humanizeSegment(text.slice(cursor, protectedMatch.index), options);
     result += protectedMatch[0];
     cursor = protectedMatch.index + protectedMatch[0].length;
   }
 
-  result += humanizeSegment(text.slice(cursor));
+  result += humanizeSegment(text.slice(cursor), options);
   return result;
 }
 

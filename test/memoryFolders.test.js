@@ -23,7 +23,9 @@ const {
   FACTS_FOLDER_SUFFIX,
   CHAT_SCOPE,
   BATTLE_SCOPE,
-  BATTLE_SCOPE_SUFFIX
+  UGCW_SCOPE,
+  BATTLE_SCOPE_SUFFIX,
+  UGCW_SCOPE_SUFFIX
 } = require('../memoryFolders');
 
 const MONGO_NAME_LIMIT = 120;
@@ -113,6 +115,8 @@ test('the chat scope keeps the original names; the battle scope appends a suffix
     assert.equal(factsFolderNameForUser(id, CHAT_SCOPE), base + FACTS_FOLDER_SUFFIX);
     assert.equal(chatFolderNameForUser(id, BATTLE_SCOPE), base + CHAT_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX);
     assert.equal(factsFolderNameForUser(id, BATTLE_SCOPE), base + FACTS_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX);
+    assert.equal(chatFolderNameForUser(id, UGCW_SCOPE), base + CHAT_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX);
+    assert.equal(factsFolderNameForUser(id, UGCW_SCOPE), base + FACTS_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX);
     assert.ok(Buffer.byteLength(chatFolderNameForUser(id, BATTLE_SCOPE), 'utf8') <= MONGO_NAME_LIMIT);
     assert.ok(Buffer.byteLength(factsFolderNameForUser(id, BATTLE_SCOPE), 'utf8') <= MONGO_NAME_LIMIT);
   }
@@ -121,7 +125,7 @@ test('the chat scope keeps the original names; the battle scope appends a suffix
 test('scoped folders never collide across users or endpoints', () => {
   const names = new Set();
   for (const id of ['alice', 'bob']) {
-    for (const scope of [CHAT_SCOPE, BATTLE_SCOPE]) {
+    for (const scope of [CHAT_SCOPE, BATTLE_SCOPE, UGCW_SCOPE]) {
       const pair = [chatFolderNameForUser(id, scope), factsFolderNameForUser(id, scope)];
       assert.notEqual(pair[0], pair[1]);
       for (const name of pair) {
@@ -139,4 +143,6 @@ test('name predicates classify the battle-scoped folders', () => {
   assert.equal(isFactsFolderName('memory_r_ann_chats_battle'), false);
   assert.equal(isChatFolderName('memory_r_ann_chats'), true);
   assert.equal(isFactsFolderName('memory_r_ann_facts'), true);
+  assert.equal(isChatFolderName('memory_r_ann_chats_ugcw'), true);
+  assert.equal(isFactsFolderName('memory_r_ann_facts_ugcw'), true);
 });

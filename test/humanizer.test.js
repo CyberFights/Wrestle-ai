@@ -37,3 +37,11 @@ test('humanizer can be disabled without changing the response', () => {
 
   assert.equal(humanizeResponse(input, { enabled: false }), input);
 });
+
+test('trapped status skips phrase-dropping rewrites but still contracts', () => {
+  const input = 'It is important to note that I am not backing down.';
+  assert.equal(
+    humanizeText(input, { trapped: true }),
+    "It's important to note that I'm not backing down."
+  );
+});

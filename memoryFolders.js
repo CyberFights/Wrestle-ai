@@ -48,12 +48,14 @@ const FACTS_FOLDER_SUFFIX = '_facts';
 // suffix); 'battle' folders append BATTLE_SCOPE_SUFFIX.
 const CHAT_SCOPE = 'chat';
 const BATTLE_SCOPE = 'battle';
+const UGCW_SCOPE = 'ugcw';
 const BATTLE_SCOPE_SUFFIX = '_battle';
+const UGCW_SCOPE_SUFFIX = '_ugcw';
 
 // MongoDB collection names max out at 120 bytes; the base name must stay
 // short enough that the longest typed folder name (base + "_chats_battle" or
 // "_facts_battle") still fits.
-const LONGEST_SCOPE_SUFFIX = CHAT_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX; // '_chats_battle'
+const LONGEST_SCOPE_SUFFIX = CHAT_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX; // '_chats_battle' / '_chats_ugcw'
 const MAX_BASE_BYTES = 120 - LONGEST_SCOPE_SUFFIX.length;
 
 function collectionNameForUser(userId) {
@@ -78,7 +80,9 @@ function collectionNameForUser(userId) {
 // Only the battle scope adds a suffix; the chat scope keeps the original names
 // so pre-existing chat folders remain valid.
 function scopeSuffix(scope) {
-  return scope === BATTLE_SCOPE ? BATTLE_SCOPE_SUFFIX : '';
+  if (scope === BATTLE_SCOPE) return BATTLE_SCOPE_SUFFIX;
+  if (scope === UGCW_SCOPE) return UGCW_SCOPE_SUFFIX;
+  return '';
 }
 
 // The user's chat messages folder:  <base>_chats[_battle]
@@ -104,14 +108,18 @@ function isUserFolderName(name) {
 // inside (see memoryStore.migrateLegacyMemory).
 function isChatFolderName(name) {
   return isUserFolderName(name) &&
-    (name.endsWith(CHAT_FOLDER_SUFFIX) || name.endsWith(CHAT_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX));
+    (name.endsWith(CHAT_FOLDER_SUFFIX) ||
+      name.endsWith(CHAT_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX) ||
+      name.endsWith(CHAT_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX));
 }
 
 // True for character facts folders of either scope (<base>_facts or
 // <base>_facts_battle) — same caveat as above.
 function isFactsFolderName(name) {
   return isUserFolderName(name) &&
-    (name.endsWith(FACTS_FOLDER_SUFFIX) || name.endsWith(FACTS_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX));
+    (name.endsWith(FACTS_FOLDER_SUFFIX) ||
+      name.endsWith(FACTS_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX) ||
+      name.endsWith(FACTS_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX));
 }
 
 module.exports = {
@@ -120,7 +128,9 @@ module.exports = {
   FACTS_FOLDER_SUFFIX,
   CHAT_SCOPE,
   BATTLE_SCOPE,
+  UGCW_SCOPE,
   BATTLE_SCOPE_SUFFIX,
+  UGCW_SCOPE_SUFFIX,
   scopeSuffix,
   collectionNameForUser,
   chatFolderNameForUser,

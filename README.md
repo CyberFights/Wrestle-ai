@@ -47,6 +47,8 @@ Run the tests with `npm test` (stubbed Mistral server, no real API key needed).
 
 ## Free response humanizer
 
+`POST /ugcw_rp` is the same battle roleplay pipeline as `POST /wrestling_bot`, except it does **not** scale damage by height or weight. Self height and weight are still accepted and injected into the system prompt. Self and opponent `health` / `trapped` (via `self` / `opponent` objects, or `self_health`, `self_trapped`, `opponent_health`, `opponent_trapped`) change move damage, the local humanizer (trapped skips phrase-dropping), and the move limiter (low health or being trapped caps outbound moves). Memory for this endpoint is stored in a separate `_ugcw` folder pair.
+
 Both `POST /wrestling_bot` and `POST /wrestling_chat` pass successful model text through a
 small local humanizer by default. It is **free**: it has no external service, API key,
 account, network request, or per-response charge. The humanizer only makes conservative

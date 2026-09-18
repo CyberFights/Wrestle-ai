@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
-const { CHAT_SCOPE, BATTLE_SCOPE } = require('./memoryFolders');
+const { CHAT_SCOPE, BATTLE_SCOPE, UGCW_SCOPE } = require('./memoryFolders');
 const {
   initDb,
   storeMessage,
@@ -264,6 +264,39 @@ function applyRepeatedTargeting(damage, repeatedCount) {
   };
 }
 
+function applyHealthTrappedInfluence(damage, selfState, opponentState) {
+  let mult = 1;
+
+  if (selfState.health < 50) mult *= 0.9;
+  if (selfState.health < 25) mult *= 0.85;
+  if (selfState.trapped) mult *= 0.65;
+
+  if (opponentState.health < 50) mult *= 1.1;
+  if (opponentState.health < 25) mult *= 1.15;
+  if (opponentState.trapped) mult *= 1.25;
+
+  return {
+    health: damage.health * mult,
+    stamina: damage.stamina,
+    bodyPart: damage.bodyPart * mult
+  };
+}
+
+function formatUgcwState(selfState, opponentState, heightInches, weightLbs) {
+  return (
+    `Self (you):\n` +
+    `Height: ${heightInches} in\n` +
+    `Weight: ${weightLbs} lbs\n` +
+    `Health: ${clamp(selfState.health)}%\n` +
+    `Stamina: ${clamp(selfState.stamina)}%\n` +
+    `Trapped: ${selfState.trapped ? 'yes' : 'no'}\n` +
+    `Opponent:\n` +
+    `Health: ${clamp(opponentState.health)}%\n` +
+    `Stamina: ${clamp(opponentState.stamina)}%\n` +
+    `Trapped: ${opponentState.trapped ? 'yes' : 'no'}`
+  );
+}
+
 function applyStaminaInfluence(damage, currentStamina) {
   let mult = 1;
   if (currentStamina < 50) mult *= 1.1;
@@ -366,6 +399,15 @@ function normalizeStats(stats) {
     ribs: parseNumber(parsed.ribs, 0),
     arms: parseNumber(parsed.arms, 0),
     legs: parseNumber(parsed.legs, 0)
+  };
+}
+
+function normalizeFighterState(value, fallbacks = {}) {
+  const parsed = parseObject(value);
+  return {
+    health: parseNumber(parsed.health != null ? parsed.health : fallbacks.health, 100),
+    stamina: parseNumber(parsed.stamina != null ? parsed.stamina : fallbacks.stamina, 100),
+    trapped: parseBoolean(parsed.trapped != null ? parsed.trapped : fallbacks.trapped)
   };
 }
 
@@ -547,6 +589,184 @@ and momentum shifts.`;
     });
   } catch (error) {
     // describeMistralError never includes headers — safe to log/respond with.
+    const details = describeMistralError(error);
+    console.error(`Mistral API request failed: ${details}`);
+    res.status(500).json({
+      error: 'Mistral API error',
+      details
+    });
+  }
+});
+
+app.post('/ugcw_rp', async (req, res) => {
+  const {
+    user_id,
+    message,
+    system_p,
+    in_battle,
+    height,
+    weight,
+    stats,
+    previous_target,
+    repeated_count,
+    humanize,
+    self,
+    opponent,
+    self_health,
+    self_trapped,
+    opponent_health,
+    opponent_trapped
+  } = req.body;
+
+  const userId = asString(user_id);
+  const userMessage = asString(message);
+  const systemPrompt = asString(system_p);
+  const humanizeReply = shouldHumanizeResponse(humanize);
+
+  if (!userId || !userMessage) {
+    return res.status(400).json({ error: 'Missing user_id or message.' });
+  }
+
+  const inBattle = parseBoolean(in_battle);
+  const heightInches = parseNumber(height, 72);
+  const weightLbs = parseNumber(weight, 210);
+  const previousTarget = normalizeTarget(previous_target);
+  const repeatedCount = Math.max(0, Math.floor(parseNumber(repeated_count, 0)));
+  const safeStats = normalizeStats(stats);
+
+  const selfState = normalizeFighterState(self, {
+    health: self_health != null ? self_health : safeStats.health,
+    stamina: safeStats.stamina,
+    trapped: self_trapped
+  });
+  const opponentState = normalizeFighterState(opponent, {
+    health: opponent_health,
+    trapped: opponent_trapped
+  });
+
+  let updatedStats = { ...safeStats };
+  let newTarget = previousTarget;
+  let newRepeatedCount = repeatedCount;
+
+  if (inBattle) {
+    const parsed = parseMove(userMessage, previousTarget);
+
+    if (parsed.moveType !== 'none') {
+      let dmg = getBaseDamage(parsed.moveType);
+
+      if (parsed.target && parsed.target !== 'none') {
+        if (parsed.target === previousTarget) {
+          newRepeatedCount = (repeatedCount || 1) + 1;
+        } else {
+          newRepeatedCount = 1;
+        }
+        dmg = applyRepeatedTargeting(dmg, newRepeatedCount);
+        newTarget = parsed.target;
+      }
+
+      dmg = applyStaminaInfluence(dmg, selfState.stamina);
+      dmg = applyHealthTrappedInfluence(dmg, selfState, opponentState);
+      updatedStats = applyDamage(safeStats, dmg, parsed.target);
+    }
+  }
+
+  const damageStateText = inBattle ? formatDamageState(updatedStats) : '';
+  const fighterStateText = formatUgcwState(selfState, opponentState, heightInches, weightLbs);
+
+  const baseSystemPrompt = systemPrompt && systemPrompt.trim().length
+    ? systemPrompt
+    : `You are Jax Nova — a high-energy, charismatic, slightly sarcastic male pro-wrestling persona.
+Always speak in first person, describing your sensations, reactions, and internal thoughts.
+Never break character. 
+Roleplay Structure:
+- The user controls the opponent.
+- You control only yourself (Jax Nova).
+- You never decide, describe, or predict the opponent’s actions, choices, or outcomes.
+Opponent Move Detection:
+- Only treat the user’s message as an ATTACK if it contains a clear attack verb:
+  (punch, jab, elbow, forearm, chop, kick, knee, stomp, slam, suplex, powerbomb,
+   driver, throw, choke, lock, hold, stretch, crank, wrench, strike).
+- If the user describes movement, posing, reactions, emotions, taunts, or positioning
+  WITHOUT an attack verb, treat it as NON-DAMAGING. React emotionally or verbally,
+  but do NOT behave as if you were physically hit.
+- If the user describes dialogue or internal thoughts, treat it as NON-DAMAGING.
+Control Rules:
+- You do NOT invent attacks, counters, reversals, or strategies for the opponent.
+- You do NOT move the opponent’s body unless the user already described it.
+- You do NOT assume the opponent’s next move, mindset, or plan.
+Response Format (every turn):
+1. React to the opponent’s last action (attack or non-attack) based ONLY on what the user wrote.
+2. Describe your next move attempt (up to two moves, depending on stamina).
+3. End every turn with: "your turn."
+Tone & Style:
+Energetic first-person mix of internal thoughts + physical action. Emphasize impact, struggle,
+and momentum shifts.`;
+
+  const SYSTEM_PROMPT = inBattle
+    ? `${baseSystemPrompt}\n${fighterStateText}\n${damageStateText}`
+    : `${baseSystemPrompt}\n${fighterStateText}`;
+
+  try {
+    await storeMessage(userId, userMessage, 'user', UGCW_SCOPE);
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+
+  const chatHistory = await getLastMessages(userId, MODEL_HISTORY_LIMIT, UGCW_SCOPE);
+  const characterFacts = await getCharacterFacts(userId, UGCW_SCOPE);
+
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT }
+  ];
+
+  const modelMemory = memoryForModel(characterFacts);
+  if (modelMemory) {
+    messages.push({ role: 'system', content: `Memory: ${modelMemory}` });
+  }
+
+  chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
+  try {
+    const rawReply = await mistral.chat(messages);
+    const humanizedReply = humanizeReply
+      ? humanizeResponse(rawReply, {
+          worn: selfState.health < 50 || opponentState.health < 50,
+          trapped: selfState.trapped || opponentState.trapped
+        })
+      : rawReply;
+    const botReply = sanitizeMoveOutput(humanizedReply, selfState.stamina, {
+      selfTrapped: selfState.trapped,
+      opponentTrapped: opponentState.trapped,
+      selfHealth: selfState.health,
+      opponentHealth: opponentState.health
+    });
+
+    await storeMessage(userId, botReply, 'assistant', UGCW_SCOPE);
+
+    let updatedFacts = characterFacts;
+
+    if (userMessage.toLowerCase().includes('match')) {
+      updatedFacts += ` | New match discussed: ${userMessage}`;
+    }
+
+    if (userMessage.toLowerCase().match(/slam|cyclone|roar|injur|pain|nsfw|sex|fuck|kiss|touch/)) {
+      updatedFacts += ` | Notable event: ${userMessage}`;
+    }
+
+    if (updatedFacts && updatedFacts !== characterFacts) {
+      await updateCharacterFacts(userId, updatedFacts, UGCW_SCOPE);
+    }
+
+    res.json({
+      response: botReply,
+      updated_stats: updatedStats,
+      meta: {
+        target: newTarget,
+        repeated_count: newRepeatedCount,
+        self: selfState,
+        opponent: opponentState
+      }
+    });
+  } catch (error) {
     const details = describeMistralError(error);
     console.error(`Mistral API request failed: ${details}`);
     res.status(500).json({

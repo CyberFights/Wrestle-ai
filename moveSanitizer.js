@@ -44,12 +44,24 @@ function isFinisherSentence(sentence) {
   return FINISHERS.some(v => lower.includes(v));
 }
 
-function keepMovesWithStamina(text, stamina) {
+function maxMovesForState(stamina, options = {}) {
+  let maxMoves = stamina < 40 ? 1 : 2;
+  if (Number.isFinite(options.selfHealth) && options.selfHealth < 25) {
+    maxMoves = Math.min(maxMoves, 1);
+  }
+  if (options.selfTrapped) maxMoves = Math.min(maxMoves, 1);
+  if (options.opponentTrapped && !options.selfTrapped) {
+    maxMoves = Math.max(maxMoves, stamina < 25 ? 1 : 2);
+  }
+  return maxMoves;
+}
+
+function keepMovesWithStamina(text, stamina, options = {}) {
   const sentences = splitSentences(text);
   let moveCount = 0;
   const result = [];
 
-  const maxMoves = stamina < 40 ? 1 : 2; // stamina suppression rule
+  const maxMoves = maxMovesForState(stamina, options);
 
   for (const sentence of sentences) {
     const isMove = isMoveSentence(sentence);
@@ -92,9 +104,9 @@ function appendYourTurn(text) {
   return base + ' your turn.';
 }
 
-function sanitizeMoveOutput(raw, stamina) {
+function sanitizeMoveOutput(raw, stamina, options = {}) {
   let text = normalize(raw);
-  text = keepMovesWithStamina(text, stamina);
+  text = keepMovesWithStamina(text, stamina, options);
   text = cleanEnding(text);
   text = appendYourTurn(text);
   return text;

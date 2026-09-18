@@ -606,11 +606,7 @@ app.post('/ugcw_rp', async (req, res) => {
     in_battle,
     height,
     weight,
-    stats,
-    previous_target,
-    repeated_count,
     humanize,
-    self,
     opponent,
     self_health,
     self_trapped,
@@ -630,13 +626,10 @@ app.post('/ugcw_rp', async (req, res) => {
   const inBattle = parseBoolean(in_battle);
   const heightInches = parseNumber(height, 72);
   const weightLbs = parseNumber(weight, 210);
-  const previousTarget = normalizeTarget(previous_target);
-  const repeatedCount = Math.max(0, Math.floor(parseNumber(repeated_count, 0)));
-  const safeStats = normalizeStats(stats);
 
-  const selfState = normalizeFighterState(self, {
-    health: self_health != null ? self_health : safeStats.health,
-    stamina: safeStats.stamina,
+  const selfState = normalizeFighterState(null, {
+    health: self_health,
+    stamina: 100,
     trapped: self_trapped
   });
   const opponentState = normalizeFighterState(opponent, {
@@ -644,33 +637,6 @@ app.post('/ugcw_rp', async (req, res) => {
     trapped: opponent_trapped
   });
 
-  let updatedStats = { ...safeStats };
-  let newTarget = previousTarget;
-  let newRepeatedCount = repeatedCount;
-
-  if (inBattle) {
-    const parsed = parseMove(userMessage, previousTarget);
-
-    if (parsed.moveType !== 'none') {
-      let dmg = getBaseDamage(parsed.moveType);
-
-      if (parsed.target && parsed.target !== 'none') {
-        if (parsed.target === previousTarget) {
-          newRepeatedCount = (repeatedCount || 1) + 1;
-        } else {
-          newRepeatedCount = 1;
-        }
-        dmg = applyRepeatedTargeting(dmg, newRepeatedCount);
-        newTarget = parsed.target;
-      }
-
-      dmg = applyStaminaInfluence(dmg, selfState.stamina);
-      dmg = applyHealthTrappedInfluence(dmg, selfState, opponentState);
-      updatedStats = applyDamage(safeStats, dmg, parsed.target);
-    }
-  }
-
-  const damageStateText = inBattle ? formatDamageState(updatedStats) : '';
   const fighterStateText = formatUgcwState(selfState, opponentState, heightInches, weightLbs);
 
   const baseSystemPrompt = systemPrompt && systemPrompt.trim().length
@@ -702,9 +668,7 @@ Tone & Style:
 Energetic first-person mix of internal thoughts + physical action. Emphasize impact, struggle,
 and momentum shifts.`;
 
-  const SYSTEM_PROMPT = inBattle
-    ? `${baseSystemPrompt}\n${fighterStateText}\n${damageStateText}`
-    : `${baseSystemPrompt}\n${fighterStateText}`;
+  const SYSTEM_PROMPT = `${baseSystemPrompt}\n${fighterStateText}`;
 
   try {
     await storeMessage(userId, userMessage, 'user', UGCW_SCOPE);
@@ -758,11 +722,7 @@ and momentum shifts.`;
 
     res.json({
       response: botReply,
-      updated_stats: updatedStats,
       meta: {
-        target: newTarget,
-        repeated_count: newRepeatedCount,
-        self: selfState,
         opponent: opponentState
       }
     });

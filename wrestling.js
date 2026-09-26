@@ -637,6 +637,9 @@ app.post('/ugcw_rp', async (req, res) => {
     trapped: opponent_trapped
   });
   let updatedOpponentState = { ...opponentState };
+  let updatedSelfState = { ...selfState };
+  let incomingDamage = { health: 0, stamina: 0, bodyPart: 0 };
+  let outgoingDamage = { health: 0, stamina: 0, bodyPart: 0 };
 
   if (inBattle) {
     const parsed = parseMove(userMessage);
@@ -645,6 +648,7 @@ app.post('/ugcw_rp', async (req, res) => {
       let damage = getBaseDamage(parsed.moveType);
       damage = applyStaminaInfluence(damage, selfState.stamina);
       damage = applyHealthTrappedInfluence(damage, selfState, opponentState);
+      incomingDamage = damage;
       updatedOpponentState = {
         ...opponentState,
         health: clamp(opponentState.health - damage.health),
@@ -725,6 +729,30 @@ and momentum shifts.`;
       opponentHealth: updatedOpponentState.health
     });
 
+    // The model controls the AI fighter, so its generated reply can contain an
+    // attack against the user. Resolve that attack too, using the opponent's
+    // post-message state as the attacker's state. This deliberately happens
+    // after generation: only an attack actually present in the AI reply deals
+    // damage; narration cannot invent a hit for it.
+    if (inBattle) {
+      const aiMove = parseMove(botReply);
+      if (aiMove.moveType !== 'none') {
+        let damage = getBaseDamage(aiMove.moveType);
+        damage = applyStaminaInfluence(damage, updatedOpponentState.stamina);
+        damage = applyHealthTrappedInfluence(
+          damage,
+          updatedSelfState,
+          updatedOpponentState
+        );
+        outgoingDamage = damage;
+        updatedOpponentState = {
+          ...updatedOpponentState,
+          health: clamp(updatedOpponentState.health - damage.health),
+          stamina: clamp(updatedOpponentState.stamina - damage.stamina)
+        };
+      }
+    }
+
     await storeMessage(userId, botReply, 'assistant', UGCW_SCOPE);
 
     let updatedFacts = characterFacts;
@@ -744,7 +772,14 @@ and momentum shifts.`;
     res.json({
       response: botReply,
       meta: {
-        opponent: updatedOpponentState
+        // opponent is the user-controlled fighter after their attack
+        opponent: updatedOpponentState,
+        // self is the AI-controlled fighter after any attack in its reply
+        self: updatedSelfState,
+        damage: {
+          from_user: incomingDamage,
+          from_ai: outgoingDamage
+        }
       }
     });
   } catch (error) {

@@ -636,8 +636,29 @@ app.post('/ugcw_rp', async (req, res) => {
     health: opponent_health,
     trapped: opponent_trapped
   });
+  let updatedOpponentState = { ...opponentState };
 
-  const fighterStateText = formatUgcwState(selfState, opponentState, heightInches, weightLbs);
+  if (inBattle) {
+    const parsed = parseMove(userMessage);
+
+    if (parsed.moveType !== 'none') {
+      let damage = getBaseDamage(parsed.moveType);
+      damage = applyStaminaInfluence(damage, selfState.stamina);
+      damage = applyHealthTrappedInfluence(damage, selfState, opponentState);
+      updatedOpponentState = {
+        ...opponentState,
+        health: clamp(opponentState.health - damage.health),
+        stamina: clamp(opponentState.stamina - damage.stamina)
+      };
+    }
+  }
+
+  const fighterStateText = formatUgcwState(
+    selfState,
+    updatedOpponentState,
+    heightInches,
+    weightLbs
+  );
 
   const baseSystemPrompt = systemPrompt && systemPrompt.trim().length
     ? systemPrompt
@@ -693,15 +714,15 @@ and momentum shifts.`;
     const rawReply = await mistral.chat(messages);
     const humanizedReply = humanizeReply
       ? humanizeResponse(rawReply, {
-          worn: selfState.health < 50 || opponentState.health < 50,
-          trapped: selfState.trapped || opponentState.trapped
+          worn: selfState.health < 50 || updatedOpponentState.health < 50,
+          trapped: selfState.trapped || updatedOpponentState.trapped
         })
       : rawReply;
     const botReply = sanitizeMoveOutput(humanizedReply, selfState.stamina, {
       selfTrapped: selfState.trapped,
-      opponentTrapped: opponentState.trapped,
+      opponentTrapped: updatedOpponentState.trapped,
       selfHealth: selfState.health,
-      opponentHealth: opponentState.health
+      opponentHealth: updatedOpponentState.health
     });
 
     await storeMessage(userId, botReply, 'assistant', UGCW_SCOPE);
@@ -723,7 +744,7 @@ and momentum shifts.`;
     res.json({
       response: botReply,
       meta: {
-        opponent: opponentState
+        opponent: updatedOpponentState
       }
     });
   } catch (error) {

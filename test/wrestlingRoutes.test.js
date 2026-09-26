@@ -9,7 +9,7 @@
  *
  * …and pins down the exact API contract the app has always had:
  *   POST /wrestling_bot  → { response, updated_stats, meta }   (+ damage math)
- *   POST /ugcw_rp        → { response, updated_stats, meta }   (no size scaling)
+ *   POST /ugcw_rp        → { response, meta: { opponent } }    (no size scaling)
  *   POST /wrestling_chat → { response }
  *   errors               → 400 / 500 shapes
  *   the model receives only the 10 most recent messages, each exactly once.
@@ -385,7 +385,7 @@ test('casual chat is not primed by prior battle turns', async () => {
   assert.match(systemPrompt.content, /conversationalist/, 'chat must use the conversational persona');
 });
 
-test('POST /ugcw_rp skips height/weight damage scaling and keeps self size in the prompt', async () => {
+test('POST /ugcw_rp returns the opponent state after applying unscaled damage', async () => {
   mistralRequests.length = 0;
 
   const res = await request('POST', '/ugcw_rp', {
@@ -394,19 +394,20 @@ test('POST /ugcw_rp skips height/weight damage scaling and keeps self size in th
     in_battle: true,
     height: 80,
     weight: 320,
-    stats: { health: 100, stamina: 100, head: 0, ribs: 0, arms: 0, legs: 0 },
-    previous_target: null,
-    repeated_count: 0,
-    self: { health: 100, stamina: 100, trapped: false },
+    self_health: 100,
+    self_trapped: false,
     opponent: { health: 100, stamina: 100, trapped: false }
   });
 
   assert.equal(res.status, 200);
-  // Same unscaled strike as wrestling_bot at default size: health -5, stamina -4, head +8
-  // (80in / 320lb would have scaled wrestling_bot down.)
-  assert.deepEqual(res.body.updated_stats, { health: 95, stamina: 96, head: 8, ribs: 0, arms: 0, legs: 0 });
-  assert.equal(res.body.meta.self.trapped, false);
-  assert.equal(res.body.meta.opponent.health, 100);
+  assert.deepEqual(Object.keys(res.body), ['response', 'meta']);
+  // The 80in / 320lb size would scale /wrestling_bot damage down. /ugcw_rp
+  // instead applies the base strike directly to the returned opponent state.
+  assert.deepEqual(res.body.meta.opponent, {
+    health: 95,
+    stamina: 96,
+    trapped: false
+  });
 
   const payload = mistralRequests[mistralRequests.length - 1].body;
   const systemPrompt = payload.messages.find(
@@ -414,37 +415,36 @@ test('POST /ugcw_rp skips height/weight damage scaling and keeps self size in th
   );
   assert.match(systemPrompt.content, /Height: 80 in/);
   assert.match(systemPrompt.content, /Weight: 320 lbs/);
+  assert.match(systemPrompt.content, /Opponent:\nHealth: 95%/);
   assert.match(systemPrompt.content, /Trapped: no/);
 });
 
-test('POST /ugcw_rp health and trapped status change move result', async () => {
+test('POST /ugcw_rp health and trapped status change opponent damage', async () => {
   const healthy = await request('POST', '/ugcw_rp', {
     user_id: 'ugcw-trap-user-a',
     message: 'I punch your jaw',
     in_battle: true,
-    height: 72,
-    weight: 210,
-    stats: { health: 100, stamina: 100, head: 0, ribs: 0, arms: 0, legs: 0 },
-    self: { health: 100, stamina: 100, trapped: false },
-    opponent: { health: 100, trapped: false }
+    self_health: 100,
+    self_trapped: false,
+    opponent: { health: 100, stamina: 100, trapped: false }
   });
 
   const trapped = await request('POST', '/ugcw_rp', {
     user_id: 'ugcw-trap-user-b',
     message: 'I punch your jaw',
     in_battle: true,
-    height: 72,
-    weight: 210,
-    stats: { health: 100, stamina: 100, head: 0, ribs: 0, arms: 0, legs: 0 },
-    self: { health: 20, stamina: 100, trapped: true },
-    opponent: { health: 20, trapped: false }
+    self_health: 20,
+    self_trapped: true,
+    opponent: { health: 20, stamina: 100, trapped: false }
   });
 
   assert.equal(healthy.status, 200);
   assert.equal(trapped.status, 200);
-  assert.ok(trapped.body.updated_stats.health > healthy.body.updated_stats.health,
-    'self trapped + low health should deal less damage');
-  assert.equal(trapped.body.meta.self.trapped, true);
+  assert.equal(healthy.body.meta.opponent.health, 95);
+  assert.ok(
+    20 - trapped.body.meta.opponent.health < 100 - healthy.body.meta.opponent.health,
+    'self trapped + low health should deal less damage'
+  );
 });
 
 test('POST /ugcw_rp history is isolated from wrestling_bot', async () => {

@@ -47,7 +47,14 @@ Run the tests with `npm test` (stubbed Mistral server, no real API key needed).
 
 ## Free response humanizer
 
-`POST /ugcw_rp` is the same battle roleplay pipeline as `POST /wrestling_bot`, except it does **not** scale damage by height or weight. Self height and weight are still accepted and injected into the system prompt. Self `health` / `trapped` are supplied with `self_health` / `self_trapped`; opponent state can be supplied with an `opponent` object or `opponent_health` / `opponent_trapped`. These states change move damage, the local humanizer (trapped skips phrase-dropping), and the move limiter (low health or being trapped caps outbound moves). For battle attacks, the response's `meta.opponent` contains the opponent's health and stamina after damage. The generated AI reply is also parsed for an attack; if one is present, it is applied to the AI fighter and returned in `meta.self`. Damage details are available in `meta.damage.from_user` and `meta.damage.from_ai` (each containing `health`, `stamina`, and `bodyPart`). Memory for this endpoint is stored in a separate `_ugcw` folder pair.
+`POST /ugcw_rp` is the same battle roleplay pipeline as `POST /wrestling_bot`, except it does **not** scale damage by height or weight. Self height and weight are still accepted and injected into the system prompt. Each fighter's state can be supplied either as a nested object (`self` / `opponent`, with `health`, `stamina`, `trapped`) or as flat fields (`self_health` / `self_stamina` / `self_trapped` and `opponent_health` / `opponent_stamina` / `opponent_trapped`). Anything omitted defaults to a fresh fighter (100 health, 100 stamina, not trapped). These states change move damage, the local humanizer (trapped skips phrase-dropping), and the move limiter (low health or being trapped caps outbound moves).
+
+Both directions of a battle turn are resolved, and each one damages the *other* fighter:
+
+- An attack found in the request `message` is dealt by `self` and damages `opponent` → `meta.opponent` plus `meta.damage.from_user`.
+- An attack found in the generated AI reply is dealt by `opponent` and damages `self` → `meta.self` plus `meta.damage.from_ai`.
+
+Each damage object contains `health`, `stamina`, and `bodyPart`, and is zeroed when that side did not attack (attacks in the AI reply are only resolved after generation, so narration alone never invents a hit). Feed `meta.self` and `meta.opponent` back in as the next request's `self` / `opponent` to carry the match forward. Memory for this endpoint is stored in a separate `_ugcw` folder pair.
 
 Both `POST /wrestling_bot` and `POST /wrestling_chat` pass successful model text through a
 small local humanizer by default. It is **free**: it has no external service, API key,

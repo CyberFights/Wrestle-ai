@@ -607,10 +607,13 @@ app.post('/ugcw_rp', async (req, res) => {
     height,
     weight,
     humanize,
+    self: selfFighter,
     opponent,
     self_health,
+    self_stamina,
     self_trapped,
     opponent_health,
+    opponent_stamina,
     opponent_trapped
   } = req.body;
 
@@ -627,13 +630,17 @@ app.post('/ugcw_rp', async (req, res) => {
   const heightInches = parseNumber(height, 72);
   const weightLbs = parseNumber(weight, 210);
 
-  const selfState = normalizeFighterState(null, {
+  // Both fighters accept either a nested object (`self` / `opponent`) or flat
+  // fields. Anything missing falls back to a fresh fighter (100 / 100 / not
+  // trapped), so callers can keep sending only the fields they track.
+  const selfState = normalizeFighterState(selfFighter, {
     health: self_health,
-    stamina: 100,
+    stamina: self_stamina,
     trapped: self_trapped
   });
   const opponentState = normalizeFighterState(opponent, {
     health: opponent_health,
+    stamina: opponent_stamina,
     trapped: opponent_trapped
   });
   let updatedOpponentState = { ...opponentState };
@@ -730,10 +737,13 @@ and momentum shifts.`;
     });
 
     // The model controls the AI fighter, so its generated reply can contain an
-    // attack against the user. Resolve that attack too, using the opponent's
-    // post-message state as the attacker's state. This deliberately happens
-    // after generation: only an attack actually present in the AI reply deals
-    // damage; narration cannot invent a hit for it.
+    // attack back at the user. Resolve that attack too: the attacker is the AI
+    // fighter in its post-message state (`updatedOpponentState`) and the target
+    // is the user's fighter (`updatedSelfState`) — the AI's own move must never
+    // be subtracted from the AI again, which is what made `meta.opponent` take
+    // both hits while `meta.self` stayed at its incoming health. This
+    // deliberately happens after generation: only an attack actually present in
+    // the AI reply deals damage; narration cannot invent a hit for it.
     if (inBattle) {
       const aiMove = parseMove(botReply);
       if (aiMove.moveType !== 'none') {
@@ -741,14 +751,14 @@ and momentum shifts.`;
         damage = applyStaminaInfluence(damage, updatedOpponentState.stamina);
         damage = applyHealthTrappedInfluence(
           damage,
-          updatedSelfState,
-          updatedOpponentState
+          updatedOpponentState, // attacker: low health / being trapped weakens the hit
+          updatedSelfState // target: low health / being trapped takes more from it
         );
         outgoingDamage = damage;
-        updatedOpponentState = {
-          ...updatedOpponentState,
-          health: clamp(updatedOpponentState.health - damage.health),
-          stamina: clamp(updatedOpponentState.stamina - damage.stamina)
+        updatedSelfState = {
+          ...updatedSelfState,
+          health: clamp(updatedSelfState.health - damage.health),
+          stamina: clamp(updatedSelfState.stamina - damage.stamina)
         };
       }
     }
@@ -772,9 +782,9 @@ and momentum shifts.`;
     res.json({
       response: botReply,
       meta: {
-        // opponent is the user-controlled fighter after their attack
+        // opponent: the fighter the user's move hit, after that damage
         opponent: updatedOpponentState,
-        // self is the AI-controlled fighter after any attack in its reply
+        // self: the user's own fighter, after any attack in the AI's reply
         self: updatedSelfState,
         damage: {
           from_user: incomingDamage,

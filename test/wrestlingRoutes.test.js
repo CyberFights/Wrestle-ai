@@ -447,6 +447,110 @@ test('POST /ugcw_rp health and trapped status change opponent damage', async () 
   );
 });
 
+test('POST /ugcw_rp applies the AI reply attack to the user fighter, not the opponent twice', async () => {
+  const previousReply = stubReply;
+  stubReply = 'I roar and slam you into the mat. your turn.';
+
+  try {
+    const res = await request('POST', '/ugcw_rp', {
+      user_id: 'ugcw-ai-damage-user',
+      message: 'I punch your jaw',
+      in_battle: true,
+      self_health: 100,
+      self_stamina: 100,
+      self_trapped: false,
+      opponent: { health: 100, stamina: 100, trapped: false }
+    });
+
+    assert.equal(res.status, 200);
+
+    // Only the user's strike touches the opponent: the AI's slam must not be
+    // subtracted from the opponent a second time.
+    assert.deepEqual(res.body.meta.damage.from_user, { health: 5, stamina: 4, bodyPart: 8 });
+    assert.deepEqual(res.body.meta.opponent, { health: 95, stamina: 96, trapped: false });
+
+    // …and the slam in the AI reply lands on the user's own fighter.
+    assert.deepEqual(res.body.meta.damage.from_ai, { health: 12, stamina: 8, bodyPart: 15 });
+    assert.deepEqual(res.body.meta.self, { health: 88, stamina: 92, trapped: false });
+  } finally {
+    stubReply = previousReply;
+  }
+});
+
+test('POST /ugcw_rp leaves the user fighter untouched when the AI reply has no attack', async () => {
+  // STUB_REPLY ("I stagger back, grinning.") carries no attack verb.
+  const res = await request('POST', '/ugcw_rp', {
+    user_id: 'ugcw-no-ai-attack-user',
+    message: 'I punch your jaw',
+    in_battle: true,
+    self_health: 70,
+    self_stamina: 60,
+    opponent: { health: 100, stamina: 100, trapped: false }
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.meta.self, { health: 70, stamina: 60, trapped: false });
+  assert.deepEqual(res.body.meta.damage.from_ai, { health: 0, stamina: 0, bodyPart: 0 });
+  assert.equal(res.body.meta.opponent.health, 95, 'the user move still damages the opponent');
+});
+
+test('POST /ugcw_rp AI damage grows against a hurt user fighter', async () => {
+  const previousReply = stubReply;
+  stubReply = 'I roar and slam you into the mat. your turn.';
+
+  try {
+    const healthy = await request('POST', '/ugcw_rp', {
+      user_id: 'ugcw-ai-dmg-healthy',
+      message: 'I punch your jaw',
+      in_battle: true,
+      self_health: 100,
+      opponent: { health: 100, stamina: 100, trapped: false }
+    });
+
+    const hurt = await request('POST', '/ugcw_rp', {
+      user_id: 'ugcw-ai-dmg-hurt',
+      message: 'I punch your jaw',
+      in_battle: true,
+      self_health: 20,
+      opponent: { health: 100, stamina: 100, trapped: false }
+    });
+
+    assert.equal(healthy.status, 200);
+    assert.equal(hurt.status, 200);
+    assert.ok(
+      20 - hurt.body.meta.self.health > 100 - healthy.body.meta.self.health,
+      'a hurt user fighter should take more damage from the AI attack'
+    );
+    assert.ok(hurt.body.meta.self.health >= 0, 'health stays clamped at 0');
+  } finally {
+    stubReply = previousReply;
+  }
+});
+
+test('POST /ugcw_rp accepts a nested self object and round-trips both fighter states', async () => {
+  mistralRequests.length = 0;
+
+  const res = await request('POST', '/ugcw_rp', {
+    user_id: 'ugcw-self-object-user',
+    message: 'I stare you down and wait',
+    in_battle: true,
+    self: { health: 64, stamina: 41, trapped: true },
+    opponent: { health: 55, stamina: 33, trapped: false }
+  });
+
+  assert.equal(res.status, 200);
+  // Neither side attacked, so both states come back exactly as supplied.
+  assert.deepEqual(res.body.meta.self, { health: 64, stamina: 41, trapped: true });
+  assert.deepEqual(res.body.meta.opponent, { health: 55, stamina: 33, trapped: false });
+
+  const payload = mistralRequests[mistralRequests.length - 1].body;
+  const systemPrompt = payload.messages.find(
+    m => m.role === 'system' && !m.content.startsWith('Memory: ')
+  );
+  assert.match(systemPrompt.content, /Health: 64%\nStamina: 41%\nTrapped: yes/);
+  assert.match(systemPrompt.content, /Opponent:\nHealth: 55%\nStamina: 33%\nTrapped: no/);
+});
+
 test('POST /ugcw_rp history is isolated from wrestling_bot', async () => {
   mistralRequests.length = 0;
 

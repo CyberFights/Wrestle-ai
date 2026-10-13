@@ -4,6 +4,18 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
+const { createResearchClient, formatResearchContext, describeResearchError } = require('./research');
+const {
+  createDataClient,
+  analyzeDataset,
+  formatAnalysisContext,
+  describeDataError
+} = require('./dataAnalysis');
+const {
+  createForecaster,
+  formatForecastContext,
+  formatForecastRefusalContext
+} = require('./forecasting');
 const { CHAT_SCOPE, BATTLE_SCOPE, UGCW_SCOPE } = require('./memoryFolders');
 const {
   initDb,
@@ -22,6 +34,24 @@ if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
 // error descriptions. IMPORTANT: never log a raw axios error object — it
 // contains config.headers.Authorization, i.e. the API key.
 const mistral = createMistralClient({ apiKey: MISTRAL_API_KEY });
+
+// Opt-in web research for /wrestling_chat (see research.js). Inert until a
+// request explicitly asks for it: creating the client never calls the
+// network, and ordinary chats never touch it. Keyless providers
+// (DuckDuckGo / Wikipedia / OpenAlex) make it work with no API key at all.
+const researchClient = createResearchClient();
+const RESEARCH_MAX_TOKENS = parsePositiveInt(process.env.RESEARCH_MAX_TOKENS, 800);
+
+// Opt-in Tier 2 data analysis for /wrestling_chat (see dataAnalysis.js):
+// structured datasets (World Bank / REST Countries / caller-supplied rows)
+// analyzed locally and deterministically. Equally inert until requested —
+// creating the client never calls the network.
+const dataClient = createDataClient();
+
+// Opt-in Tier 3 predictive modeling for /wrestling_chat (see forecasting.js):
+// local, deterministic forecasting over a Tier 2 dataset's series. Inert
+// until requested; creating it never calls the network (it has no I/O).
+const forecaster = createForecaster();
 
 const app = express();
 
@@ -428,6 +458,55 @@ function memoryForModel(characterFacts) {
   );
 }
 
+// Tier 2 dataset spec resolution. Three caller shapes, most explicit first:
+//   dataset: { provider: 'worldbank', country: 'CAN', indicator: '…' }  (or
+//            { provider: 'restcountries', code: 'CAN' }, or { rows: [...] },
+//            or a JSON string of any of those)
+//   data:    [...] / { rows: [...] } / JSON-or-CSV string  (inline rows)
+//   flat:    data_provider + country/indicator/… fields
+// Returns null when the request carries no dataset at all.
+function buildDatasetSpec(body) {
+  if (Array.isArray(body.dataset)) return { provider: 'inline', rows: body.dataset };
+  const dataset = parseObject(body.dataset);
+  if (Object.keys(dataset).length) return dataset;
+  if (body.data != null) return { provider: 'inline', data: body.data };
+
+  const flat = {};
+  const fields = ['country', 'countries', 'indicator', 'start_year', 'end_year', 'region', 'code', 'codes', 'name'];
+  if (body.data_provider != null) flat.provider = body.data_provider;
+  for (const field of fields) {
+    if (body[field] != null) flat[field] = body[field];
+  }
+  return Object.keys(flat).length ? flat : null;
+}
+
+// Explicit request fields (analysis_x / analysis_y / analysis_group_by or
+// x/y/groupBy inside the dataset object) win over provider defaults such as
+// World Bank's year/value.
+function analysisOptionsFor(body, defaults = {}) {
+  const dataset = parseObject(body.dataset);
+  return {
+    x: asString(body.analysis_x).trim() || dataset.x || defaults.x,
+    y: body.analysis_y ?? dataset.y ?? defaults.y,
+    groupBy: asString(body.analysis_group_by).trim() || dataset.groupBy || dataset.group_by || defaults.groupBy
+  };
+}
+
+// Tier 3 forecast options. x/y come from the Tier 2 analysis selection so
+// the forecast always models exactly the series that was analyzed; the
+// forecast_* request fields (prediction_* accepted as aliases) tune the rest.
+function forecastOptionsFor(body, selection = {}) {
+  return {
+    x: selection.x,
+    y: Array.isArray(selection.y) ? selection.y[0] : selection.y,
+    horizon: parseNumber(body.forecast_horizon ?? body.prediction_horizon, undefined),
+    at: parseNumber(body.forecast_at ?? body.prediction_at, undefined),
+    method: asString(body.forecast_method || body.prediction_method).trim().toLowerCase() || undefined,
+    threshold: parseNumber(body.forecast_threshold ?? body.prediction_threshold, undefined),
+    simulations: parseNumber(body.forecast_simulations, undefined)
+  };
+}
+
 // ---------- ROUTES ----------
 
 app.get('/', (req, res) => {
@@ -803,11 +882,37 @@ and momentum shifts.`;
 });
 
 app.post('/wrestling_chat', async (req, res) => {
-  const { user_id, message, system_p, humanize } = req.body;
+  const {
+    user_id,
+    message,
+    system_p,
+    humanize,
+    research,
+    research_query,
+    research_max_results,
+    research_provider,
+    analysis,
+    prediction,
+    forecast
+  } = req.body;
   const userId = asString(user_id);
   const userMessage = asString(message);
   const systemPrompt = asString(system_p);
   const humanizeReply = shouldHumanizeResponse(humanize);
+  // Research is strictly opt-in: only an explicit truthy `research` field
+  // (same parsing as `humanize`, so form-encoded 'true' works) triggers any
+  // external call. Without it this endpoint behaves exactly as before.
+  const researchRequested = parseOptionalBoolean(research, false);
+  const requestedResearchProvider = asString(research_provider).trim().toLowerCase() || undefined;
+  // Tier 2 is opt-in the same way: only an explicit truthy `analysis` field
+  // fetches a dataset or analyzes anything. Ordinary and Tier-1-only
+  // requests never touch it.
+  const analysisRequested = parseOptionalBoolean(analysis, false);
+  // Tier 3 likewise: `prediction: true` (alias `forecast: true`). A
+  // prediction implies the Tier 2 pipeline — it needs a dataset and an
+  // analyzed series to model — so the dataset is fetched at most once and
+  // shared between the two tiers.
+  const predictionRequested = parseOptionalBoolean(prediction ?? forecast, false);
 
   if (!userId || !userMessage) return res.status(400).json({ error: 'Missing user_id or message.' });
   const SYSTEM_PROMPT = systemPrompt && systemPrompt.trim().length
@@ -838,10 +943,168 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
   if (modelMemory) {
     messages.push({ role: 'system', content: `Memory: ${modelMemory}` });
   }
+
+  // Opt-in research (Tier 1): fetch current/external sources BEFORE the
+  // Mistral call and inject them as one extra system message. Fail-open by
+  // design — a missing key, disabled server, or provider outage degrades to
+  // an ordinary chat reply (reported in meta.research) rather than a 500,
+  // and research results are never written into character facts/memory.
+  let researchContext = '';
+  let researchMeta = null;
+  if (researchRequested) {
+    const query = asString(research_query).trim() || userMessage;
+    try {
+      const result = await researchClient.search(query, {
+        maxResults: parseNumber(research_max_results, undefined),
+        provider: requestedResearchProvider
+      });
+      researchContext = formatResearchContext(result, researchClient.maxContextChars);
+      researchMeta = {
+        requested: true,
+        status: 'ok',
+        provider: result.provider,
+        query: result.query,
+        cached: Boolean(result.cached),
+        sources: result.results.map(source => ({ title: source.title, url: source.url }))
+      };
+    } catch (error) {
+      const details = describeResearchError(error);
+      const unavailable = [
+        'RESEARCH_DISABLED',
+        'RESEARCH_NOT_CONFIGURED',
+        'RESEARCH_UNKNOWN_PROVIDER'
+      ].includes(error && error.code);
+      researchMeta = {
+        requested: true,
+        status: unavailable ? 'unavailable' : 'error',
+        error: details,
+        ...(requestedResearchProvider ? { provider: requestedResearchProvider } : {})
+      };
+      // describeResearchError never includes headers — safe to log.
+      console.warn(`Research failed for /wrestling_chat request: ${details}`);
+    }
+  }
+  if (researchContext) {
+    messages.push({ role: 'system', content: researchContext });
+  }
+
+  // Opt-in data analysis (Tier 2) and predictive modeling (Tier 3) share
+  // one dataset resolution: resolve the dataset (structured provider or
+  // inline rows), compute every number locally, and inject only those
+  // computed results. The model narrates; it never does the math and never
+  // invents a forecast. Fail-open exactly like Tier 1, and dataset /
+  // analysis / forecast content is never written into character facts.
+  let analysisContext = '';
+  let analysisMeta = null;
+  let forecastContext = '';
+  let predictionMeta = null;
+  if (analysisRequested || predictionRequested) {
+    let dataset = null;
+    let summary = null;
+    try {
+      dataset = await dataClient.fetchDataset(buildDatasetSpec(req.body));
+      summary = analyzeDataset(
+        dataset.rows,
+        analysisOptionsFor(req.body, dataset.defaults || {})
+      );
+    } catch (error) {
+      const details = describeDataError(error);
+      const unavailable = [
+        'ANALYSIS_DISABLED',
+        'DATA_NOT_PROVIDED',
+        'DATA_UNKNOWN_PROVIDER'
+      ].includes(error && error.code);
+      const status = unavailable ? 'unavailable' : 'error';
+      if (analysisRequested) {
+        analysisMeta = { requested: true, status, error: details };
+      }
+      if (predictionRequested) {
+        // No dataset → no series → nothing to model. Reported on the
+        // prediction block the caller actually asked for.
+        predictionMeta = { requested: true, status, error: details };
+      }
+      // describeDataError never includes headers — safe to log.
+      console.warn(`Dataset resolution failed for /wrestling_chat request: ${details}`);
+    }
+
+    if (dataset && summary) {
+      let forecastComputed = false;
+      if (predictionRequested) {
+        try {
+          const forecastResult = forecaster.forecast(
+            dataset.rows,
+            forecastOptionsFor(req.body, summary.selection || {})
+          );
+          forecastComputed = true;
+          forecastContext = formatForecastContext(dataset, forecastResult, forecaster.maxContextChars);
+          predictionMeta = {
+            requested: true,
+            status: 'ok',
+            dataset: {
+              provider: dataset.provider,
+              description: dataset.description,
+              rowCount: dataset.rows.length
+            },
+            forecast: forecastResult
+          };
+        } catch (error) {
+          if (error && error.code === 'FORECAST_INSUFFICIENT') {
+            // Refusal is a first-class outcome: the model is told to explain
+            // why no responsible forecast exists instead of guessing one.
+            const reasons = (error.reasons && error.reasons.length) ? error.reasons : [error.message];
+            forecastContext = formatForecastRefusalContext(reasons, forecaster.maxContextChars);
+            predictionMeta = { requested: true, status: 'insufficient', reasons };
+          } else {
+            const details = error && error.message ? error.message : String(error);
+            const unavailable = ['FORECAST_DISABLED', 'FORECAST_BAD_METHOD'].includes(error && error.code);
+            predictionMeta = {
+              requested: true,
+              status: unavailable ? 'unavailable' : 'error',
+              error: details
+            };
+          }
+          console.warn(`Forecast failed for /wrestling_chat request: ${predictionMeta.error || (predictionMeta.reasons || []).join(' ')}`);
+        }
+      }
+
+      if (analysisRequested) {
+        analysisContext = formatAnalysisContext(
+          dataset,
+          summary,
+          dataClient.maxContextChars,
+          { forecastComputed }
+        );
+        analysisMeta = {
+          requested: true,
+          status: 'ok',
+          dataset: {
+            provider: dataset.provider,
+            description: dataset.description,
+            rowCount: dataset.rows.length,
+            ...(dataset.truncated ? { truncated: true } : {}),
+            ...(dataset.cached ? { cached: true } : {})
+          },
+          summary
+        };
+      }
+    }
+  }
+  if (analysisContext) {
+    messages.push({ role: 'system', content: analysisContext });
+  }
+  if (forecastContext) {
+    messages.push({ role: 'system', content: forecastContext });
+  }
   chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
 
   try {
-    const rawReply = await mistral.chat(messages);
+    // Enhanced (research/analysis/forecast) replies need more room than the
+    // 250-token chat default; only the token cap changes, and only on
+    // requests that asked for one of the enhanced modes. A forecast-refusal
+    // block counts: the model needs room to explain the refusal.
+    const rawReply = (researchContext || analysisContext || forecastContext)
+      ? await mistral.chat(messages, { max_tokens: RESEARCH_MAX_TOKENS })
+      : await mistral.chat(messages);
     const botReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
     await storeMessage(userId, botReply, 'assistant', CHAT_SCOPE);
 
@@ -857,6 +1120,19 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
       await updateCharacterFacts(userId, updatedFacts, CHAT_SCOPE);
     }
 
+    // Backward compatible: the plain { response } shape is unchanged unless
+    // the caller opted into research, analysis, and/or prediction, which add
+    // their meta blocks alongside it.
+    if (researchRequested || analysisRequested || predictionRequested) {
+      return res.json({
+        response: botReply,
+        meta: {
+          ...(researchRequested ? { research: researchMeta } : {}),
+          ...(analysisRequested ? { analysis: analysisMeta } : {}),
+          ...(predictionRequested ? { prediction: predictionMeta } : {})
+        }
+      });
+    }
     res.json({ response: botReply });
   } catch (error) {
     const details = describeMistralError(error);

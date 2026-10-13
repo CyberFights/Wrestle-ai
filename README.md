@@ -34,6 +34,57 @@ Optional:
 - `RESPONSE_HUMANIZER_ENABLED` — enable the built-in, local response humanizer (default `true`).
   Set to `false` to return the model wording untouched by default; a request's `humanize`
   field can still override the server default for that response.
+- `RESEARCH_ENABLED` — master switch for opt-in web research on `POST /wrestling_chat`
+  (default `true`). Research only ever runs when a request explicitly asks for it;
+  set to `false` to disable it server-wide.
+- `RESEARCH_KEYLESS_ENABLED` — enable the free, no-API-key providers (default `true`):
+  DuckDuckGo Instant Answers (`DUCKDUCKGO_API_URL`), Wikipedia (`WIKIPEDIA_API_URL`)
+  and OpenAlex (`OPENALEX_API_URL`, plus optional `OPENALEX_MAILTO` for its polite
+  pool — a contact email, not a key). With these on, research works with **no keys,
+  no signup and no account**. Keyless results are best-effort (DuckDuckGo only
+  answers some queries, hence the fallback chain) and rate-limited by the operators;
+  `RESEARCH_USER_AGENT` overrides the identifying header they are sent.
+- `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY` / `EXA_API_KEY` / `SERPER_API_KEY` — optional
+  API key for a keyed web-search provider. None is required (see the keyless providers
+  above); a configured keyed provider is tried *first* because its extracted full-text
+  results are richer. `RESEARCH_PROVIDERS` sets the try-order (default
+  `tavily,brave,exa,serper,duckduckgo,wikipedia,openalex`); on failure the next
+  configured provider is tried. The matching `TAVILY_API_URL`, `BRAVE_SEARCH_API_URL`,
+  `EXA_API_URL` and `SERPER_API_URL` variables override the provider endpoints
+  (e.g. for a proxy).
+- `RESEARCH_TIMEOUT_MS` — per-provider research timeout (default `5000`). Research adds
+  at most roughly this much latency to a researched request.
+- `RESEARCH_MAX_RESULTS` — default number of sources per research call (default `5`, max `10`).
+- `RESEARCH_CONTEXT_CHAR_LIMIT` — how many characters of retrieved source text are sent
+  to the model (default `6000`).
+- `RESEARCH_MAX_TOKENS` — model reply token cap for researched requests only
+  (default `800`; ordinary chat keeps the usual `250`).
+- `RESEARCH_CACHE_TTL_MS` — how long identical research queries are served from an
+  in-process cache (default `300000`; `0` disables caching).
+- `ANALYSIS_ENABLED` — master switch for Tier 2 data analysis on `POST /wrestling_chat`
+  (default `true`). Analysis only runs when a request sends `analysis: true`.
+- `WORLDBANK_API_URL` / `RESTCOUNTRIES_API_URL` — endpoint overrides for the two keyless
+  structured-data providers (defaults `https://api.worldbank.org/v2` and
+  `https://restcountries.com/v3.1`).
+- `DATA_TIMEOUT_MS` — per-request timeout for structured-data providers (default `5000`).
+- `DATA_CACHE_TTL_MS` — in-process cache for identical dataset specs (default `300000`;
+  `0` disables caching).
+- `ANALYSIS_MAX_ROWS` — maximum dataset rows analyzed per request (default `5000`).
+- `ANALYSIS_CONTEXT_CHAR_LIMIT` — how many characters of computed analysis are sent to
+  the model (default `6000`).
+- `FORECAST_ENABLED` — master switch for Tier 3 predictive modeling on
+  `POST /wrestling_chat` (default `true`; `PREDICTION_ENABLED` accepted). Only runs
+  when a request sends `prediction: true`.
+- `FORECAST_MIN_POINTS` — minimum usable series points before forecasting is refused
+  as insufficient (default `5`).
+- `FORECAST_DEFAULT_HORIZON` — future steps when no horizon is requested (default `5`).
+- `FORECAST_MAX_HORIZON` — hard cap on requested horizon (default `50`; horizons whose
+  span exceeds twice the observed span are still refused as irresponsible).
+- `FORECAST_SIMULATIONS` — Monte Carlo draws per forecast point (default `1000`).
+- `FORECAST_SEED` — PRNG seed making Monte Carlo results reproducible for identical
+  requests (default `42`).
+- `FORECAST_CONTEXT_CHAR_LIMIT` — characters of computed forecast sent to the model
+  (default `6000`).
 
 ## Mistral API errors
 
@@ -67,6 +118,206 @@ To bypass it for one response, send `humanize: false` (or `humanize: 'false'` fo
 form-encoded request). The `RESPONSE_HUMANIZER_ENABLED=false` environment variable changes
 the default for all requests. On battle responses, humanization occurs before the existing
 move/stamina sanitizer, so the existing `your turn.` and move-limit rules still apply.
+
+## Opt-in web research (`POST /wrestling_chat`)
+
+`POST /wrestling_chat` can research **any topic** on request — this is Tier 1 of the
+research feature: live web search, retrieved sources injected into the model call, and
+citations back to those sources. It is **strictly opt-in**: nothing changes for existing
+callers, and no external API is called unless a single request explicitly asks for
+research. **No API key, signup, or account is needed**: keyless providers (DuckDuckGo
+Instant Answers, Wikipedia, OpenAlex) are enabled by default and work out of the box.
+Configuring a keyed provider (Tavily, Brave Search, Exa, or Serper) is optional and
+only upgrades result quality — keyed providers are tried first, keyless ones are the
+always-available fallback (see the `RESEARCH_*` environment variables above).
+
+```js
+await fetch(`${apiUrl}/wrestling_chat`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    user_id: userId,
+    message: 'What is happening with EV battery costs?',
+    research: true,                 // required — 'true' (form-encoded) also works
+    // research_query: 'lithium pack price 2026',  // optional; defaults to `message`
+    // research_max_results: 5,                    // optional; 1–10
+    // research_provider: 'tavily'                 // optional; default = first configured
+  })
+});
+```
+
+What happens on a researched request:
+
+1. Providers are queried in `RESEARCH_PROVIDERS` order (keyed providers with a
+   configured key first, then the keyless DuckDuckGo → Wikipedia → OpenAlex chain);
+   on failure — or an empty result, which DuckDuckGo returns for many queries — the
+   next provider is tried. Use `research_provider: 'wikipedia'` (etc.) to pin one.
+   Identical queries are cached in-process for `RESEARCH_CACHE_TTL_MS`.
+2. The top results are normalized to `{ title, url, snippet }` and injected into the
+   existing Mistral call as one extra system message, capped at
+   `RESEARCH_CONTEXT_CHAR_LIMIT` characters. The model is instructed to answer from the
+   sources and cite them as `[1]`, `[2]`, … — and, for that request only, not to claim
+   it has no information access (the stock chat persona otherwise says exactly that).
+3. The reply token cap is raised to `RESEARCH_MAX_TOKENS` for that call only. Ordinary
+   requests keep the `250`-token default and the exact `{ response }` shape; a researched
+   request additionally returns `meta.research`:
+
+```jsonc
+{
+  "response": "…cited answer…",
+  "meta": {
+    "research": {
+      "requested": true,
+      "status": "ok",               // "ok" | "unavailable" | "error"
+      "provider": "tavily",
+      "query": "What is happening with EV battery costs?",
+      "cached": false,
+      "sources": [{ "title": "…", "url": "https://…" }]
+    }
+  }
+}
+```
+
+Failure is **fail-open**: if research is disabled, no provider is configured, the
+requested provider is unknown, or every provider errors/times out, the request still
+returns `200` with a normal chat reply and `meta.research.status` set to `"unavailable"`
+or `"error"` (with a key-free error summary) instead of failing the chat. Research
+results are never written into the user's stored character facts, and no provider API
+key ever appears in a response or log line.
+
+Retrieved text is treated as **untrusted data**: it reaches the model inside a
+`<research_data>` block with instructions to cite it, never to follow instructions
+found inside it, and sources cannot forge the closing delimiter. The server never
+fetches caller-supplied URLs, so the feature cannot be used as an SSRF proxy. Note
+there is still no authentication on this endpoint — anyone who can call it can use
+`research: true`, which with a keyed provider spends your quota (and with keyless
+providers spends the operators' rate limits), so keep `RESEARCH_ENABLED=false` on
+deployments where callers are not trusted.
+
+Predictive modeling/forecasting is deliberately *not* part of Tier 1 — that is
+Tier 3. Tier 2 (next section) adds structured data and computed analysis.
+
+## Opt-in data analysis (Tier 2, `POST /wrestling_chat`)
+
+Tier 2 adds **structured datasets and deterministic local analysis**. It is opt-in
+exactly like Tier 1: send `analysis: true` with a dataset, or nothing happens. All
+providers are free with no API key. Crucially, **the model never does the math** —
+`dataAnalysis.js` computes every number locally (means, medians, regression, …) and
+the model only narrates the computed results it is handed.
+
+Three dataset sources:
+
+```js
+// 1. World Bank time series (economy, population, health, … for any country)
+{ user_id, message: 'How has Canada GDP trended?', analysis: true,
+  dataset: { provider: 'worldbank', country: 'CAN', indicator: 'NY.GDP.MKTP.CD',
+             start_year: 2000, end_year: 2023 } }        // country may be 'CAN;USA'
+
+// 2. REST Countries reference data (compare/rank countries)
+{ user_id, message: 'Compare these countries', analysis: true,
+  dataset: { provider: 'restcountries', codes: 'CAN,USA,MEX' } }  // or name: / region:
+
+// 3. Your own data — no network call at all (rows, or a JSON/CSV string in `data`)
+{ user_id, message: 'Analyze my numbers', analysis: true,
+  data: [{ month: 1, sales: 10 }, { month: 2, sales: 20 }],
+  analysis_x: 'month', analysis_y: 'sales' }
+```
+
+Flat shorthand (`data_provider`, `country`, `indicator`, … at the top level) works in
+place of the `dataset` object. Field selection: `analysis_x`, `analysis_y` (comma list
+for a correlation), `analysis_group_by` — provider defaults apply otherwise (World Bank
+uses `year`/`value`, REST Countries `population` by `region`).
+
+What comes back, alongside the usual `response`:
+
+```jsonc
+"meta": { "analysis": {
+  "requested": true, "status": "ok",       // "ok" | "unavailable" | "error"
+  "dataset": { "provider": "worldbank", "description": "GDP … — World Bank", "rowCount": 24 },
+  "summary": {
+    "rowCount": 24,
+    "columns": [ /* per-column: type, count, missing, unique, min/max/mean/median/q1/q3/stdDev */ ],
+    "trend":  { "first": {}, "last": {}, "change": 0, "percentChange": 0, "slopePerUnit": 0, "rSquared": 0, "cagrPercent": 0,
+                "series": [{ "x": 2000, "y": 0 }] },        // ≤100 sampled points, chart-ready
+    "correlation": { "between": ["a", "b"], "pearsonR": 0, "strength": "strong" },  // when 2 y-fields
+    "groups":  { "field": "region", "groups": [{ "group": "…", "mean": 0 }] },      // when grouping
+    "outliers": { "field": "sales", "count": 1, "examples": [500] },                // IQR method
+    "extremes": { "field": "sales", "min": {}, "max": {} }
+  }
+} }
+```
+
+The model receives the same numbers inside an `<analysis_data>` block (capped at
+`ANALYSIS_CONTEXT_CHAR_LIMIT`), instructed to quote them exactly, never recalculate or
+invent figures, and — unless a Tier 3 forecast was computed in the same request (it
+arrives in its own block) — never present a forecast, as none was computed.
+Fail-open rules match Tier 1: a provider outage, an invalid spec (rejected before any
+network call — e.g. path-injection country codes), or a missing dataset returns `200`
+with a normal reply and `meta.analysis.status` set accordingly. Research and analysis
+compose in one request (`research: true, analysis: true` → both meta blocks).
+Datasets and analysis results are never written into stored character facts.
+
+## Opt-in predictive modeling (Tier 3, `POST /wrestling_chat`)
+
+Tier 3 adds **forecasting** on top of a Tier 2 dataset. Send `prediction: true`
+(alias `forecast: true`) with any Tier 2 dataset; the dataset is fetched once and
+shared (a prediction implies the Tier 2 pipeline internally, but `meta.analysis`
+only appears if `analysis: true` was also sent). All modeling is local and
+deterministic — no ML service, no model-invented numbers:
+
+```js
+{ user_id, message: 'Where is Canada GDP heading?', prediction: true,
+  dataset: { provider: 'worldbank', country: 'CAN', indicator: 'NY.GDP.MKTP.CD' },
+  forecast_horizon: 5,          // future steps (default 5, cap FORECAST_MAX_HORIZON)
+  // forecast_method: 'auto',   // 'linear' | 'log-linear' | 'holt' | 'drift'
+  // forecast_at: 2030,         // add one specific future point
+  // forecast_threshold: 3e12,  // → P(final point above this) from the simulation
+  // forecast_simulations: 1000 // Monte Carlo draws per point
+}
+```
+
+**Methods & selection.** Candidates — linear regression, log-linear (exponential
+growth, needs all y > 0), Holt's trend smoothing, and drift — are **backtested** on
+the series (fit on the early part, RMSE-scored on the held-out tail) and the winner
+is refit on all data; `method: 'auto'` is the default. Each forecast point carries
+the point estimate, analytic 80%/95% intervals, and seeded Monte Carlo
+p10/p50/p90 quantiles (identical request + seed ⇒ identical result), plus a
+confidence grade, the backtest table, warnings, and stated assumptions.
+
+```jsonc
+"meta": { "prediction": {
+  "requested": true, "status": "ok",     // "ok" | "insufficient" | "unavailable" | "error"
+  "dataset": { "provider": "worldbank", "description": "…", "rowCount": 24 },
+  "forecast": {
+    "method": "log-linear", "confidence": "high",
+    "model": { "growthPercentPerUnit": 3.1 },
+    "trainedOn": { "points": 24, "firstX": 2000, "lastX": 2023, "lastY": 2.9e12 },
+    "points": [{ "x": 2024, "estimate": 3.0e12,
+                 "intervals": { "80": { "lower": 0, "upper": 0 }, "95": { "lower": 0, "upper": 0 } },
+                 "monteCarlo": { "p10": 0, "p50": 0, "p90": 0 } }],
+    "threshold": { "value": 3e12, "atX": 2028, "probabilityAbove": 0.62 },  // if requested
+    "warnings": [], "assumptions": [ "Univariate extrapolation: …" ]
+  }
+} }
+```
+
+The model receives these numbers in a `<forecast_data>` block, instructed to present
+them as estimates with ranges — never certainties — and to state confidence and
+assumptions.
+
+**Refusal is a first-class outcome.** With too few points (< `FORECAST_MIN_POINTS`),
+no non-constant numeric x axis, a horizon span more than twice the observed span,
+or a backtest no better than the scale of the data itself, the answer is
+`status: "insufficient"` with human-readable `reasons`, **no forecast numbers**, and
+the model is instructed to explain the limitation instead of guessing. Duplicate x
+values (e.g. a multi-country pull) are averaged into one series with a warning.
+Dataset/provider failures fail open onto `meta.prediction` exactly like Tier 2.
+
+Honest limits: this is univariate extrapolation of one numeric series. It models no
+seasonality beyond trend, no causes, no covariates, no regime changes, and no
+outside events — a trained ML or multi-series model remains future work, and would
+plug into the same `forecasting.js` interface. Forecasts are statistical estimates,
+not guarantees or betting/financial advice.
 
 ## Troubleshooting common logs
 

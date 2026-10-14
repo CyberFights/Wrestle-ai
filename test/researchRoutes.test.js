@@ -296,7 +296,8 @@ test('a provider outage fails open: 200, normal reply, meta.research reports the
       sources: 0,
       used: [],
       invalid: [],
-      uncited: false
+      uncited: false,
+      stripped: []
     });
   } finally {
     researchStatus = 200;

@@ -242,3 +242,25 @@ test('the guard tells the model not to recycle its own earlier turns', async () 
   assert.ok(notice);
   assert.match(notice.content, /Earlier turns in this conversation are not a source/);
 });
+
+test('the research notice is the LAST message, not buried above the history', async () => {
+  mistralRequests.length = 0;
+
+  // Seed a few turns so there is a real history for the notice to sit behind.
+  await request({ user_id: 'guard-user', message: 'hey Jax' });
+  await request({ user_id: 'guard-user', message: 'how is it going?' });
+  mistralRequests.length = 0;
+
+  await request({ user_id: 'guard-user', message: 'what is the latest on the ridge?' });
+
+  const payload = lastPayload();
+  const last = payload.messages[payload.messages.length - 1];
+  assert.ok(
+    String(last.content).includes('No live lookup ran'),
+    'the constraint must be the last thing the model reads, not the first'
+  );
+  assert.ok(
+    payload.messages.length > 2,
+    'and there must actually be history in front of it for this to mean anything'
+  );
+});

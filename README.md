@@ -231,7 +231,8 @@ What happens on a researched request:
         "sources": 1,
         "used": [1],
         "invalid": [],              // markers pointing at a source that doesn't exist
-        "uncited": false            // sources were supplied and none were cited
+        "uncited": false,           // sources were supplied and none were cited
+        "stripped": []              // markers the server removed from the reply
       }
     }
   }
@@ -256,10 +257,25 @@ sourced one). On such a turn `meta.research.citations.sources` is `0`, so any ci
 marker in the reply is listed under `invalid` rather than shipped as if it pointed at
 something.
 
-The `citations` audit is diagnostic only — the reply text is returned unedited — and the
-local humanizer leaves `[n]` markers untouched, so what the audit counts is what the
-caller received. Research results are never written into the user's stored character
-facts, and no provider API key ever appears in a response or log line.
+The audit is a report; the **sanitizer** is the control. On any lookup-shaped turn the
+reply is passed through `sanitizeFabricatedCitations()` before it is returned or stored:
+a marker survives only if it names a source that was actually supplied this turn
+(with sources `[1]`, a `[4]` is deleted; with no sources, every marker is deleted).
+Returned text is what the caller sees, and the *stored* text is sanitized too — which is
+what stops the compounding loop, because otherwise the next request replays the model's
+own fabricated markers back to it as history. Replayed assistant turns additionally have
+their markers stripped from the prompt copy (`stripCitationMarkers()`), so markers left
+in history by older turns are not copied forward either; stored history itself is never
+rewritten. The local humanizer leaves `[n]` markers untouched, so what the audit counts
+is what the caller received, and `citations.stripped` lists what the sanitizer removed.
+
+The research message — sources, or one of the two notices — is injected as the **last**
+message, immediately before generation, rather than above the replayed history: it is the
+constraint that matters most on such a turn, and instructions furthest from the point of
+generation carry the least weight.
+
+Research results are never written into the user's stored character facts, and no
+provider API key ever appears in a response or log line.
 
 The failure notice covers a lookup that **ran and returned nothing**. The commoner case
 is that no lookup ran at all: research is opt-in, so a message like "research the two

@@ -19,6 +19,8 @@ const {
   formatResearchFailureNotice,
   formatNoLiveDataNotice,
   auditCitations,
+  sanitizeFabricatedCitations,
+  stripCitationMarkers,
   detectResearchIntent,
   utcDateStamp,
   describeResearchError,
@@ -478,4 +480,33 @@ test('detectResearchIntent treats imperative listings as requests, not just ques
   // Still not a lookup: a request with no time-sensitive window.
   assert.equal(detectResearchIntent('list what you remember about our match'), false);
   assert.equal(detectResearchIntent('tell me a joke'), false);
+});
+
+test('sanitizeFabricatedCitations removes only markers that cannot point anywhere', () => {
+  // Sources [1][2] supplied: [1] and [2] are real, [4] is invented.
+  assert.deepEqual(
+    sanitizeFabricatedCitations('Real [1], real [2], invented [4].', 2),
+    { text: 'Real [1], real [2], invented.', removed: [4] }
+  );
+  // No sources at all: every marker goes.
+  assert.deepEqual(
+    sanitizeFabricatedCitations('Nothing since [1] in the past 30 days [2].', 0),
+    { text: 'Nothing since in the past 30 days.', removed: [1, 2] }
+  );
+  // Clean replies are returned byte-for-byte.
+  assert.deepEqual(
+    sanitizeFabricatedCitations('No markers here at all.', 3),
+    { text: 'No markers here at all.', removed: [] }
+  );
+  assert.deepEqual(sanitizeFabricatedCitations('[0] and [999]', 0), { text: 'and', removed: [0, 999] });
+  assert.deepEqual(sanitizeFabricatedCitations(null, 2), { text: '', removed: [] });
+});
+
+test('stripCitationMarkers clears the replayed-history copy without touching prose', () => {
+  assert.equal(
+    stripCitationMarkers('No 6.7 or 6.8 on the ridge [1][2], per the archives.'),
+    'No 6.7 or 6.8 on the ridge, per the archives.'
+  );
+  assert.equal(stripCitationMarkers('plain text'), 'plain text');
+  assert.equal(stripCitationMarkers(undefined), '');
 });

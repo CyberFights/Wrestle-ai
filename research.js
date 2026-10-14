@@ -1063,12 +1063,64 @@ function detectResearchIntent(text) {
   return RESEARCH_QUESTION_FORM.test(value) || RESEARCH_REQUEST_VERBS.test(value);
 }
 
+/*
+ * Strip citation markers altogether. Used on the replayed-history copies of
+ * assistant turns: markers there were never backed by anything (the model
+ * cannot cite what it was not given), and leaving them in the context is what
+ * lets an invented "[1]" get copied forward into the next reply as though it
+ * pointed somewhere.
+ */
+function stripCitationMarkers(text) {
+  if (typeof text !== 'string' || !text) return typeof text === 'string' ? text : '';
+  return tidyMarkerRemoval(text.replace(/\s*\[\d{1,3}\]/g, ''));
+}
+
+function tidyMarkerRemoval(text) {
+  return text
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/ +([,.;:!?])/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/*
+ * Enforcement, not audit.
+ *
+ * auditCitations() reports the markers; this removes the ones that cannot
+ * point anywhere. A marker is legitimate only when it names a source that was
+ * actually supplied on this turn — so with sources [1] and [2], "[1]…[4]"
+ * keeps [1] and drops [4]; with no sources at all, every marker goes.
+ *
+ * The prompt already tells the model to cite only what it was given. Four
+ * answers in a row cited what it wasn't, which is the point at which advice
+ * stops being a control: this is the deterministic version. It is also what
+ * stops the loop, because the sanitized reply is what gets stored — the model
+ * stops being handed its own fabricated markers as history.
+ */
+function sanitizeFabricatedCitations(text, sourceCount) {
+  const value = typeof text === 'string' ? text : '';
+  const count = Number.isInteger(sourceCount) && sourceCount > 0 ? sourceCount : 0;
+  const removed = new Set();
+  const kept = value.replace(/\s*\[(\d{1,3})\]/g, (match, digits) => {
+    const index = parseInt(digits, 10);
+    if (index >= 1 && index <= count) return match;
+    removed.add(index);
+    return '';
+  });
+  return {
+    text: removed.size ? tidyMarkerRemoval(kept) : value,
+    removed: [...removed].sort((a, b) => a - b)
+  };
+}
+
 module.exports = {
   createResearchClient,
   formatResearchContext,
   formatResearchFailureNotice,
   formatNoLiveDataNotice,
   auditCitations,
+  sanitizeFabricatedCitations,
+  stripCitationMarkers,
   detectResearchIntent,
   utcDateStamp,
   describeResearchError,

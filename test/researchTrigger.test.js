@@ -176,13 +176,26 @@ test('"research X" typed in the message triggers a lookup with no research field
   assert.match(block.content, /only material you may present as retrieved/);
   assert.match(block.content, /magnitude 6\.7 and a magnitude 6\.8/);
 
-  // The audit splits the real citation from the invented one.
+  // The audit splits the real citation from the invented one, and the
+  // sanitizer removes the invented one from the reply the caller receives.
   assert.deepEqual(res.body.meta.research.citations, {
     sources: 1,
     used: [1],
     invalid: [4],
-    uncited: false
+    uncited: false,
+    stripped: [4]
   });
+  assert.equal(
+    res.body.response,
+    'Two events on the ridge, per [1]. A third is reported in.',
+    'the marker pointing at no source is gone from the returned reply'
+  );
+
+  // And from what was stored: the next turn must not be handed the fabricated
+  // marker back as history.
+  const stored = (chats.get('trigger-user|chat') || []).map(c => c.content);
+  assert.ok(stored.some(c => c === res.body.response), 'the sanitized text is what gets stored');
+  assert.ok(!stored.some(c => c.includes('[4]')), 'no fabricated marker survives into history');
 });
 
 test('a plainly time-sensitive question also triggers a lookup', async () => {

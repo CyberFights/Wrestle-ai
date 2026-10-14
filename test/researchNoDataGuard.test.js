@@ -226,3 +226,19 @@ test('when research does run, the sourced block replaces the guard', async () =>
   const block = payload.messages.find(m => String(m.content).includes('<research_data>'));
   assert.ok(block, 'the retrieved sources are what the model is given');
 });
+
+test('the guard tells the model not to recycle its own earlier turns', async () => {
+  mistralRequests.length = 0;
+
+  // The compounding case: the model's own unverified claims from earlier turns
+  // come back as history and get restated as fact. The notice must close that
+  // loop as well as the "no retrieval" one.
+  await request({
+    user_id: 'guard-user',
+    message: 'list all Mid-Atlantic Ridge earthquakes in the last 30 days'
+  });
+
+  const notice = noticeIn(lastPayload());
+  assert.ok(notice);
+  assert.match(notice.content, /Earlier turns in this conversation are not a source/);
+});

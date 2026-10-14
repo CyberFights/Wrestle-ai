@@ -226,6 +226,24 @@ test('with no topic anywhere in the conversation, no lookup runs and the reply i
   assert.match(notice.content, /short follow-up/);
 });
 
+test('a caller-supplied fragment of the message is ignored in favour of the message', async () => {
+  providerQueries.length = 0;
+
+  const message = 'research the two Atlantic ridge earthquakes that happened yesterday';
+  // The reported client behaviour: only a word or two reaches research_query.
+  for (const fragment of ['research', 'Atlantic', 'the two Atlantic']) {
+    const res = await request({
+      user_id: 'fragment-user',
+      message,
+      research: true,
+      research_query: fragment
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.meta.research.query, message, `fragment ${JSON.stringify(fragment)} must not become the query`);
+  }
+});
+
 test('a substantive message is still used verbatim', async () => {
   providerQueries.length = 0;
 

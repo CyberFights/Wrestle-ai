@@ -71,7 +71,13 @@ const duckRequests = [];
 const duckStub = http.createServer((req, res) => {
   duckRequests.push({ url: req.url });
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ Heading: 'x', AbstractURL: 'https://example.com/x', AbstractText: 'x', Results: [], RelatedTopics: [] }));
+  res.end(JSON.stringify({
+    Heading: 'Mid-Atlantic Ridge earthquake',
+    AbstractURL: 'https://example.com/mid-atlantic-ridge-earthquake',
+    AbstractText: 'The central Mid-Atlantic Ridge produced two earthquakes above magnitude 6.0 on 13 October 2026.',
+    Results: [],
+    RelatedTopics: []
+  }));
 });
 
 // ---------- helpers / boot ----------

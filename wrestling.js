@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
-const { createResearchClient, formatResearchContext, formatResearchFailureNotice, formatNoLiveDataNotice, auditCitations, sanitizeFabricatedCitations, stripCitationMarkers, detectResearchIntent, buildResearchQuery, describeResearchError, ResearchError } = require('./research');
+const { createResearchClient, formatResearchContext, formatResearchFailureNotice, formatNoLiveDataNotice, auditCitations, sanitizeFabricatedCitations, stripCitationMarkers, detectResearchIntent, buildResearchQuery, isQueryFragment, describeResearchError, ResearchError } = require('./research');
 const {
   createDataClient,
   analyzeDataset,
@@ -984,8 +984,12 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
     // Katy Perry and celebrity gossip. With no topic to inherit there is
     // nothing worth searching, and the turn is answered without a lookup.
     const explicitQuery = asString(research_query).trim();
+    // A caller-supplied query that is only a word or two lifted out of the
+    // message is a client-side fragment (a topic field, a tokenised message),
+    // not a topic: the message is the better query.
+    const querySeed = explicitQuery && !isQueryFragment(explicitQuery, userMessage) ? explicitQuery : userMessage;
     try {
-      const builtQuery = buildResearchQuery(explicitQuery || userMessage, chatHistory);
+      const builtQuery = buildResearchQuery(querySeed, chatHistory);
       const query = builtQuery.query;
       if (!query) {
         throw new ResearchError(

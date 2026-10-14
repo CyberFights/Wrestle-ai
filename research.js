@@ -998,6 +998,12 @@ function createResearchClient(options = {}) {
         if (!results.length) {
           throw new ResearchError('RESEARCH_EMPTY', `Research provider "${name}" returned no usable results.`);
         }
+        // Off-topic sources are not sources. Screening here, before anything
+        // reaches the model, is the deterministic version of what it has had
+        // to do by hand: notice the results are about the wrong subject.
+        if (!resultsMatchQuery(query, results)) {
+          throw new ResearchError('RESEARCH_OFF_TOPIC', `Research provider "${name}" returned results unrelated to the query.`);
+        }
         const result = { provider: name, query, results, cached: false };
         cacheSet(cacheKey, result);
         return { ...result, results: results.map(r => ({ ...r })) };
@@ -1323,6 +1329,98 @@ function sanitizeFabricatedCitations(text, sourceCount) {
  */
 const AFFIRMATION_ONLY = /^(?:ok(?:ay)?|k|kk|sure|yes|yeah|yep|yup|ya|no|nope|nah|right|got it|gotcha|thanks|thank you|thx|ty|please|pls|go ahead|go on|go for it|do it|do that|sure thing|sure do|yes please|yes go|yes do(?: it)?|ok go|okay go|ok do(?: it)?|okay do(?: it)?|ok then|okay then|ok so|okay so|fine|cool|nice|great|interesting|wow|lol|haha|hmm+|hm+|uh huh|and|also|then|next|more|continue|carry on|what else|anything else|really|seriously|tell me more|more please|dig deeper|keep going|expand|elaborate|explain|so|well|alright|all right|no way|yikes|ouch)[\s.,!?…]*$/i;
 const MIN_RESEARCH_QUERY_CHARS = 8;
+// Words that ask for a lookup or name the machinery of one, without naming a
+// subject: "research", "keep digging for the right sources", "look it up".
+// A message built only from these is a request to search, not a thing to
+// search for — and searching it returns what the words mean. The word
+// "research" alone returns research definitions, academic platforms and
+// journal-publishing sites, which is exactly the batch the model then had to
+// report as irrelevant.
+const LOOKUP_META_WORDS = new Set([
+  'research', 'researches', 'researched', 'researching', 'search', 'searches', 'searched',
+  'searching', 'google', 'lookup', 'look', 'looking', 'find', 'finding', 'check', 'checking',
+  'verify', 'verifying', 'investigate', 'investigating', 'dig', 'digging', 'deeper', 'browse',
+  'browsing', 'fetch', 'fetching', 'pull', 'pulling', 'show', 'showing', 'give', 'tell',
+  'source', 'sources', 'archive', 'archives', 'feed', 'feeds', 'record', 'records',
+  'data', 'info', 'information', 'online', 'please', 'right', 'correct', 'actual', 'real',
+  'again', 'more', 'most', 'some', 'any', 'about', 'into', 'from', 'with', 'without', 'that',
+  'this', 'these', 'those', 'them', 'they', 'just', 'keep', 'keeps', 'keeping', 'continue',
+  'continuing', 'going', 'want', 'need', 'give', 'make', 'sure', 'thing', 'things', 'stuff',
+  'something', 'anything', 'what', 'when', 'where', 'which', 'your', 'yours', 'mine', 'have',
+  'having', 'would', 'could', 'should', 'will', 'shall', 'must', 'can', 'may', 'might', 'got',
+  'getting', 'let', 'lets', 'now', 'then', 'there', 'here', 'also', 'very', 'really', 'much',
+  'many', 'done', 'fine', 'good', 'great', 'nice', 'cool', 'well', 'work', 'works', 'help',
+  'helping', 'try', 'trying'
+]);
+
+// Low-value words that should not by themselves make a query look topical.
+const RELEVANCE_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'that', 'this', 'these', 'those', 'from', 'into', 'about',
+  'what', 'when', 'where', 'which', 'while', 'were', 'was', 'are', 'is', 'be', 'been', 'being',
+  'have', 'has', 'had', 'does', 'did', 'doing', 'there', 'their', 'them', 'they', 'you', 'your',
+  'any', 'all', 'some', 'most', 'more', 'much', 'many', 'last', 'past', 'next', 'again', 'still',
+  'just', 'only', 'also', 'very', 'really', 'please', 'research', 'researched', 'researching',
+  'search', 'searching', 'find', 'look', 'lookup', 'check', 'verify', 'list', 'give', 'tell',
+  'show', 'sources', 'source', 'data', 'info', 'information', 'records', 'record', 'archives',
+  'archive', 'feeds', 'feed', 'online', 'today', 'yesterday', 'tomorrow', 'days', 'weeks',
+  'months', 'years', 'hours', 'minutes', 'query', 'queries', 'near', 'around', 'recent',
+  'recently', 'new', 'test'
+]);
+
+// The content words of a query, used both to judge whether a message names a
+// topic at all and to judge whether retrieved sources are about it.
+function contentTerms(text) {
+  const words = String(text == null ? '' : text).toLowerCase().match(/[a-z][a-z'\u2019-]{2,}/g) || [];
+  const terms = new Set();
+  for (const word of words) {
+    const term = word.replace(/['\u2019]s$/, '');
+    if (term.length < 4) continue;
+    if (LOOKUP_META_WORDS.has(term) || RELEVANCE_STOPWORDS.has(term)) continue;
+    terms.add(term);
+  }
+  return [...terms];
+}
+
+/*
+ * Are these results even about the query?
+ *
+ * The keyless chain will happily answer "research" with research definitions,
+ * "ok" with the history of the word, and a ridge question with a celebrity
+ * magazine. Injecting that is worse than injecting nothing: it hands the model
+ * confident material about the wrong subject and burns a turn while it
+ * explains that the sources are irrelevant — which is precisely what happened
+ * twice in a row before this check existed.
+ *
+ * The test is deliberately lenient: at least one content word of the query
+ * must appear in the titles or snippets. A query with no content words is not
+ * screened (there is nothing to judge on), and a provider whose results fail
+ * is treated like any other provider failure — the chain moves on, and if
+ * every provider fails the turn ends with the honest "I could not retrieve
+ * anything" notice instead of unrelated text presented as sources.
+ */
+function resultsMatchQuery(query, results) {
+  const terms = contentTerms(query);
+  // Only a query with real topic information is judged: "world cup" can
+  // legitimately come back as "Argentina beats France in the final", and
+  // rejecting a good result is worse than tolerating a bad one. The screen is
+  // for egregious mismatches — a ridge question answered with research
+  // definitions — so it stays out of the way for short or thin queries.
+  if (terms.length < 3) return true;
+  const list = Array.isArray(results) ? results : [];
+  if (!list.length) return true; // emptiness is RESEARCH_EMPTY's business
+  const haystack = list
+    .map(result => `${result && result.title ? result.title : ''} ${result && result.snippet ? result.snippet : ''}`)
+    .join(' ')
+    .toLowerCase();
+  if (!haystack.trim()) return true;
+  return terms.some(term => {
+    if (haystack.includes(term)) return true;
+    // Match a stem so plural/inflected forms still count: "earthquake" for
+    // "earthquakes", "seismic" for "seismicity".
+    const stem = term.length >= 6 ? term.slice(0, Math.max(5, term.length - 2)) : term;
+    return stem.length >= 5 && haystack.includes(stem);
+  });
+}
 
 function isThinResearchQuery(text) {
   const value = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
@@ -1332,7 +1430,34 @@ function isThinResearchQuery(text) {
   // Comma-joined affirmations ("sure, go ahead", "ok then, thanks") are still
   // one acknowledgement, not a topic.
   const parts = value.split(/[,;.!?…]+/).map(part => part.trim()).filter(Boolean);
-  return parts.length > 1 && parts.every(part => AFFIRMATION_ONLY.test(part));
+  if (parts.length > 1 && parts.every(part => AFFIRMATION_ONLY.test(part))) return true;
+  // A message made only of lookup words ("research", "look it up", "keep
+  // digging for the right sources") asks for a search but names no subject:
+  // searching it returns what those words mean, not what the user is after.
+  return contentTerms(value).length === 0;
+}
+
+/*
+ * A caller-supplied query that is one word lifted out of the message the user
+ * actually sent is a fragment, not a topic. Clients that build `research_query`
+ * from a tokenised message (or a "topic" field) send things like
+ * `research_query: "research"` for "research the two Atlantic ridge
+ * earthquakes…" — and a build that searches that verbatim returns research
+ * definitions, academic platforms and journal-publishing sites, which is
+ * exactly the batch a live answer then had to report as irrelevant. The
+ * message is the better query whenever the caller's is a fragment of it.
+ */
+function isQueryFragment(query, message) {
+  const value = String(query == null ? '' : query).replace(/\s+/g, ' ').trim().toLowerCase();
+  const full = String(message == null ? '' : message).replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!value || !full || value === full) return false;
+  if (!full.includes(value)) return false;
+  const queryWords = value.split(' ').filter(Boolean);
+  const messageWords = full.split(' ').filter(Boolean);
+  // A short run of words ("research", "the two Atlantic") lifted out of a
+  // message that is meaningfully longer — a topic field or a tokenised
+  // message, not an independently written query.
+  return queryWords.length <= 3 && messageWords.length >= queryWords.length + 3;
 }
 
 function buildResearchQuery(latestMessage, history) {
@@ -1362,6 +1487,9 @@ module.exports = {
   detectResearchIntent,
   buildResearchQuery,
   isThinResearchQuery,
+  contentTerms,
+  resultsMatchQuery,
+  isQueryFragment,
   utcDateStamp,
   describeResearchError,
   ResearchError,

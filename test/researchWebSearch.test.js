@@ -66,8 +66,8 @@ function bingRedirect(target) {
 }
 
 const BING_HTML = `<html><body><ol id="b_results">
-<li class="b_algo" data-id="1"><h2><a href="https://example.com/bing-one" h="ID=SERP,1">Bing &amp; One</a></h2><div class="b_caption"><p>First <strong>Bing</strong> snippet.</p></div></li>
-<li class="b_algo" data-id="2"><h2><a href="${bingRedirect('https://example.com/bing-redirected')}">Redirected Result</a></h2><div class="b_caption"><p>Second snippet.</p></div></li>
+<li class="b_algo" data-id="1"><h2><a href="https://example.com/bing-one" h="ID=SERP,1">Best Espresso Machines &amp; Grinders</a></h2><div class="b_caption"><p>First <strong>Bing</strong> result for espresso machine prices.</p></div></li>
+<li class="b_algo" data-id="2"><h2><a href="${bingRedirect('https://example.com/bing-redirected')}">Refurbished Espresso Machine Prices</a></h2><div class="b_caption"><p>Second espresso machine result.</p></div></li>
 <li class="b_ad"><h2><a href="https://example.com/ad">Ad, Not A Web Result</a></h2><p>Ad snippet.</p></li>
 </ol></body></html>`;
 
@@ -163,8 +163,8 @@ test('bing_web normalizes results and decodes /ck/a redirectors', async t => {
 
   assert.equal(result.provider, 'bing_web');
   assert.deepEqual(result.results, [
-    { title: 'Bing & One', url: 'https://example.com/bing-one', snippet: 'First Bing snippet.' },
-    { title: 'Redirected Result', url: 'https://example.com/bing-redirected', snippet: 'Second snippet.' }
+    { title: 'Best Espresso Machines & Grinders', url: 'https://example.com/bing-one', snippet: 'First Bing result for espresso machine prices.' },
+    { title: 'Refurbished Espresso Machine Prices', url: 'https://example.com/bing-redirected', snippet: 'Second espresso machine result.' }
   ], 'direct and redirector links both land on the real source; the b_ad block is not a result');
   assert.match(stub.requests[0].headers['user-agent'], /Mozilla\/5\.0/);
 });

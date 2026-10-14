@@ -23,6 +23,8 @@ const {
   stripCitationMarkers,
   buildResearchQuery,
   isThinResearchQuery,
+  isQueryFragment,
+  resultsMatchQuery,
   detectResearchIntent,
   utcDateStamp,
   describeResearchError,
@@ -547,4 +549,42 @@ test('buildResearchQuery inherits the topic from the most recent substantive use
   // Nothing to inherit anywhere: an empty query, so no lookup runs.
   assert.deepEqual(buildResearchQuery('ok', []), { query: '', inherited: false });
   assert.deepEqual(buildResearchQuery('ok', undefined), { query: '', inherited: false });
+});
+
+test('isQueryFragment spots a caller-supplied query lifted out of the message', () => {
+  const message = 'research the two Atlantic ridge earthquakes that happened yesterday';
+
+  // The reported symptom: only the first word reaches the provider as the
+  // caller's query. Both the verb and a content word are fragments of the
+  // longer message, so the message is the better query.
+  assert.equal(isQueryFragment('research', message), true);
+  assert.equal(isQueryFragment('Atlantic', message), true);
+  assert.equal(isQueryFragment('the two Atlantic', message), true);
+
+  // Not fragments: the whole message, an unrelated query, or a short message
+  // that is itself the topic.
+  assert.equal(isQueryFragment(message, message), false);
+  assert.equal(isQueryFragment('lithium iron phosphate prices', message), false);
+  assert.equal(isQueryFragment('earthquakes', 'earthquakes'), false);
+  assert.equal(isQueryFragment('earthquakes', 'any earthquakes?'), false);
+  assert.equal(isQueryFragment('', message), false);
+});
+
+test('resultsMatchQuery rejects sources about a different subject', () => {
+  const ridgeQuery = 'research the two Atlantic ridge earthquakes';
+  // The live regression: a ridge question answered with research definitions.
+  assert.equal(resultsMatchQuery(ridgeQuery, [{
+    title: 'Research - Wikipedia',
+    snippet: 'Research is creative and systematic work undertaken to increase knowledge.'
+  }]), false);
+  assert.equal(resultsMatchQuery(ridgeQuery, [
+    { title: 'M 6.8 - central Mid-Atlantic Ridge', snippet: 'Magnitude 6.8 (mww); depth 10 km.' }
+  ]), true);
+  // Inflected forms still match ("earthquake" for "earthquakes").
+  assert.equal(resultsMatchQuery(ridgeQuery, [
+    { title: 'Earthquake strikes the ridge', snippet: 'A magnitude 6.8 earthquake.' }
+  ]), true);
+  // Thin queries are not judged; an empty result set is not the screen's business.
+  assert.equal(resultsMatchQuery('world cup', [{ title: 'Argentina wins the final', snippet: 'x' }]), true);
+  assert.equal(resultsMatchQuery(ridgeQuery, []), true);
 });

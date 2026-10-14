@@ -205,6 +205,25 @@ What happens on a researched request:
    next provider is tried. Use `research_provider: 'wikipedia'` (etc.) to pin one.
    Identical queries are cached in-process for `RESEARCH_CACHE_TTL_MS`.
 
+   **A caller-supplied fragment is not a query.** Clients that build
+   `research_query` from a tokenised message (or a "topic" field) can send one word —
+   `research_query: "research"` for "research the two Atlantic ridge earthquakes…",
+   which a build searching it verbatim answers with research definitions, academic
+   platforms and journal-publishing sites. `isQueryFragment()` detects a short run of
+   words lifted out of the message the user actually sent (up to three words, against
+   a meaningfully longer message) and the message is used instead. See
+   `test/researchQueryTopic.test.js`.
+
+   **Retrieved sources have to be about the query.** `resultsMatchQuery()` screens each
+   provider's results before anything reaches the model: at least one content word of
+   the query must appear in the titles or snippets (stemmed, so "earthquake" matches
+   "earthquakes"). A provider whose results fail is treated like any other provider
+   failure — the chain moves on, and if every provider fails the turn ends with the
+   honest "I could not retrieve anything" notice instead of a page about the wrong
+   subject presented as a source. Queries with fewer than three content words are not
+   judged, so short or ambiguous queries are never second-guessed. See
+   `test/research.test.js`.
+
    **The query has to name a topic.** `research_query` and the request's own message
    can both carry a bare follow-up, and a follow-up is not a search: a user who types
    "ok" after asking about the Mid-Atlantic Ridge has not changed the subject, but

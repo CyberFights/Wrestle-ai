@@ -279,8 +279,25 @@ test('a provider outage fails open: 200, normal reply, meta.research reports the
     assert.ok(!res.body.meta.research.error.includes(RESEARCH_KEY));
 
     const payload = mistralRequests[mistralRequests.length - 1].body;
-    assert.equal(payload.max_tokens, 250, 'no context was injected, so the default cap applies');
+    // Fail-open, but not fail-silent: no sources block (there are no
+    // sources), yet the model is told the lookup failed and given the room
+    // to explain it — the alternative is a source-free model improvising a
+    // research-shaped answer, which is the failure this guards against.
+    assert.equal(payload.max_tokens, 800, 'the failure notice needs the enhanced cap, not the 250 chat default');
     assert.ok(!payload.messages.some(m => String(m.content).includes('<research_data>')));
+    const notice = payload.messages.find(m => String(m.content).includes('the lookup FAILED'));
+    assert.ok(notice, 'a failed lookup must tell the model it failed');
+    assert.equal(notice.role, 'system');
+    assert.match(notice.content, /never say or imply that you searched/);
+    assert.match(notice.content, /503/);
+    // Nothing in the notice may be presented as retrieved material.
+    assert.ok(!res.body.meta.research.sources, 'no sources are reported on failure');
+    assert.deepEqual(res.body.meta.research.citations, {
+      sources: 0,
+      used: [],
+      invalid: [],
+      uncited: false
+    });
   } finally {
     researchStatus = 200;
   }

@@ -6,11 +6,12 @@
  * It runs entirely in this process: there is no third-party API, account,
  * token, or per-request charge. Rather than generating new content (which
  * could change a wrestling move or take control of the opponent), it only
- * makes common overly formal wording more conversational. URLs and inline or
- * fenced code are left untouched.
+ * makes common overly formal wording more conversational. URLs, inline or
+ * fenced code, and bracketed citation markers ([1], [2] …) are left
+ * untouched — a reworded marker would point at the wrong source, or at none.
  */
 
-const PROTECTED_SEGMENTS = /```[\s\S]*?```|`[^`\r\n]*`|(?:https?:\/\/|www\.)[^\s<>()]+/gi;
+const PROTECTED_SEGMENTS = /```[\s\S]*?```|`[^`\r\n]*`|(?:https?:\/\/|www\.)[^\s<>()]+|\[\d{1,3}\]/gi;
 
 // Keep the replacement's capitalization natural when a match begins a
 // sentence or is written in all caps.

@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
-const { createResearchClient, formatResearchContext, describeResearchError } = require('./research');
+const { createResearchClient, formatResearchContext, formatResearchFailureNotice, auditCitations, detectResearchIntent, describeResearchError } = require('./research');
 const {
   createDataClient,
   analyzeDataset,
@@ -41,6 +41,14 @@ const mistral = createMistralClient({ apiKey: MISTRAL_API_KEY });
 // (DuckDuckGo / Wikipedia / OpenAlex) make it work with no API key at all.
 const researchClient = createResearchClient();
 const RESEARCH_MAX_TOKENS = parsePositiveInt(process.env.RESEARCH_MAX_TOKENS, 800);
+// Optional heuristic triggering. The endpoint's contract is strict opt-in:
+// only the request's `research` field starts a lookup. But "research the two
+// Atlantic ridge earthquakes" typed into a chat box is an explicit request to
+// a human reader and an ordinary string to the API, so with this on, a message
+// that asks for a lookup (or asks a plainly time-sensitive question) turns
+// research on by itself. Off by default — no deployment gets surprise network
+// calls or surprise provider costs unless it asks for them.
+const RESEARCH_AUTO_TRIGGER = parseOptionalBoolean(process.env.RESEARCH_AUTO_TRIGGER, false);
 
 // Opt-in Tier 2 data analysis for /wrestling_chat (see dataAnalysis.js):
 // structured datasets (World Bank / REST Countries / caller-supplied rows)
@@ -899,10 +907,15 @@ app.post('/wrestling_chat', async (req, res) => {
   const userMessage = asString(message);
   const systemPrompt = asString(system_p);
   const humanizeReply = shouldHumanizeResponse(humanize);
-  // Research is strictly opt-in: only an explicit truthy `research` field
-  // (same parsing as `humanize`, so form-encoded 'true' works) triggers any
-  // external call. Without it this endpoint behaves exactly as before.
-  const researchRequested = parseOptionalBoolean(research, false);
+  // Research is opt-in: an explicit truthy `research` field (same parsing as
+  // `humanize`, so form-encoded 'true' works) always triggers it. Without
+  // that field this endpoint behaves exactly as before unless the operator
+  // enabled RESEARCH_AUTO_TRIGGER, in which case a message that clearly asks
+  // for a lookup counts as the request (see detectResearchIntent).
+  const researchExplicit = parseOptionalBoolean(research, false);
+  const researchAuto = !researchExplicit && RESEARCH_AUTO_TRIGGER && detectResearchIntent(userMessage);
+  const researchRequested = researchExplicit || researchAuto;
+  const researchTrigger = researchExplicit ? 'explicit' : 'auto';
   const requestedResearchProvider = asString(research_provider).trim().toLowerCase() || undefined;
   // Tier 2 is opt-in the same way: only an explicit truthy `analysis` field
   // fetches a dataset or analyzes anything. Ordinary and Tier-1-only
@@ -949,7 +962,14 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
   // design — a missing key, disabled server, or provider outage degrades to
   // an ordinary chat reply (reported in meta.research) rather than a 500,
   // and research results are never written into character facts/memory.
+  //
+  // Fail-open is not fail-silent, though. If the lookup was requested and
+  // returned nothing, the model still gets a system message — the failure
+  // notice — because an unanswered "research X" with no instruction against
+  // improvising is exactly how a confident, source-free, citation-shaped
+  // non-answer gets produced.
   let researchContext = '';
+  let researchSystemMessage = '';
   let researchMeta = null;
   if (researchRequested) {
     const query = asString(research_query).trim() || userMessage;
@@ -959,8 +979,10 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
         provider: requestedResearchProvider
       });
       researchContext = formatResearchContext(result, researchClient.maxContextChars);
+      researchSystemMessage = researchContext;
       researchMeta = {
         requested: true,
+        trigger: researchTrigger,
         status: 'ok',
         provider: result.provider,
         query: result.query,
@@ -976,16 +998,18 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
       ].includes(error && error.code);
       researchMeta = {
         requested: true,
+        trigger: researchTrigger,
         status: unavailable ? 'unavailable' : 'error',
         error: details,
         ...(requestedResearchProvider ? { provider: requestedResearchProvider } : {})
       };
+      researchSystemMessage = formatResearchFailureNotice(details);
       // describeResearchError never includes headers — safe to log.
       console.warn(`Research failed for /wrestling_chat request: ${details}`);
     }
   }
-  if (researchContext) {
-    messages.push({ role: 'system', content: researchContext });
+  if (researchSystemMessage) {
+    messages.push({ role: 'system', content: researchSystemMessage });
   }
 
   // Opt-in data analysis (Tier 2) and predictive modeling (Tier 3) share
@@ -1101,12 +1125,26 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
     // Enhanced (research/analysis/forecast) replies need more room than the
     // 250-token chat default; only the token cap changes, and only on
     // requests that asked for one of the enhanced modes. A forecast-refusal
-    // block counts: the model needs room to explain the refusal.
-    const rawReply = (researchContext || analysisContext || forecastContext)
+    // block counts: the model needs room to explain the refusal. So does a
+    // research-failure notice — the honest "I could not retrieve anything"
+    // reply needs the same room as a sourced one.
+    const rawReply = (researchSystemMessage || analysisContext || forecastContext)
       ? await mistral.chat(messages, { max_tokens: RESEARCH_MAX_TOKENS })
       : await mistral.chat(messages);
     const botReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
     await storeMessage(userId, botReply, 'assistant', CHAT_SCOPE);
+
+    // Compare the citation markers the model wrote against the sources it was
+    // actually given. Purely diagnostic — the reply is returned unedited —
+    // but it makes an unauditable claim auditable: on a failed lookup the
+    // source count is 0, so any [1]/[2] the model emitted is reported as an
+    // invalid citation instead of shipping as if it pointed at something.
+    if (researchRequested) {
+      researchMeta = {
+        ...researchMeta,
+        citations: auditCitations(rawReply, (researchMeta && researchMeta.sources || []).length)
+      };
+    }
 
     // Memory update logic (simple)
     let updatedFacts = characterFacts;

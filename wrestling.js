@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
-const { createResearchClient, formatResearchContext, formatResearchFailureNotice, formatNoLiveDataNotice, auditCitations, sanitizeFabricatedCitations, stripCitationMarkers, detectResearchIntent, describeResearchError } = require('./research');
+const { createResearchClient, formatResearchContext, formatResearchFailureNotice, formatNoLiveDataNotice, auditCitations, sanitizeFabricatedCitations, stripCitationMarkers, detectResearchIntent, buildResearchQuery, describeResearchError, ResearchError } = require('./research');
 const {
   createDataClient,
   analyzeDataset,
@@ -977,8 +977,22 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
   let researchSystemMessage = '';
   let researchMeta = null;
   if (researchRequested) {
-    const query = asString(research_query).trim() || userMessage;
+    // The query has to name a topic. A bare follow-up ("ok", "sure", "dig
+    // deeper") inherits the topic from the most recent substantive user turn
+    // instead of being searched verbatim — searching "ok" returns the history
+    // of the word, which is how a ridge question got answered with Wikipedia,
+    // Katy Perry and celebrity gossip. With no topic to inherit there is
+    // nothing worth searching, and the turn is answered without a lookup.
+    const explicitQuery = asString(research_query).trim();
     try {
+      const builtQuery = buildResearchQuery(explicitQuery || userMessage, chatHistory);
+      const query = builtQuery.query;
+      if (!query) {
+        throw new ResearchError(
+          'RESEARCH_NO_QUERY',
+          'No research query could be formed: this message is a short follow-up and no earlier turn in the conversation names a topic.'
+        );
+      }
       const result = await researchClient.search(query, {
         maxResults: parseNumber(research_max_results, undefined),
         provider: requestedResearchProvider
@@ -999,7 +1013,8 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
       const unavailable = [
         'RESEARCH_DISABLED',
         'RESEARCH_NOT_CONFIGURED',
-        'RESEARCH_UNKNOWN_PROVIDER'
+        'RESEARCH_UNKNOWN_PROVIDER',
+        'RESEARCH_NO_QUERY'
       ].includes(error && error.code);
       researchMeta = {
         requested: true,

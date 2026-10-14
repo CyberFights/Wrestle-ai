@@ -205,6 +205,21 @@ What happens on a researched request:
    next provider is tried. Use `research_provider: 'wikipedia'` (etc.) to pin one.
    Identical queries are cached in-process for `RESEARCH_CACHE_TTL_MS`.
 
+   **The query has to name a topic.** `research_query` and the request's own message
+   can both carry a bare follow-up, and a follow-up is not a search: a user who types
+   "ok" after asking about the Mid-Atlantic Ridge has not changed the subject, but
+   "ok" used to be what went to the provider — which searched the history of the word
+   and returned Wikipedia, Katy Perry and celebrity gossip, leaving the model to
+   correctly report that none of it was about earthquakes. A thin message (`ok`,
+   `sure, go ahead`, `dig deeper`, `more`) therefore inherits its topic from the most
+   recent substantive user turn. If there is nothing to inherit, **no lookup runs**:
+   the request reports `meta.research.status = "unavailable"` with a `short follow-up`
+   explanation and the model is sent the failure notice, so it says it could not check
+   rather than answering the word. An irrelevant lookup is worse than no lookup,
+   because it fills the context with confident material about the wrong subject.
+   `buildResearchQuery()` / `isThinResearchQuery()` implement this; see
+   `test/researchQueryTopic.test.js`.
+
    The `usgs` provider is the one that does not search the web. It queries the keyless
    USGS FDSN event catalog and translates the question into catalog parameters
    conservatively: a stated magnitude and window are honoured ("magnitude 6.0+ in the

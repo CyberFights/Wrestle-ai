@@ -37,6 +37,15 @@ Optional:
 - `RESEARCH_ENABLED` — master switch for opt-in web research on `POST /wrestling_chat`
   (default `true`). Research only ever runs when a request explicitly asks for it;
   set to `false` to disable it server-wide.
+- `RESEARCH_AUTO_TRIGGER` — infer the request from the message text (default `false`).
+  When a client can't be changed to send `research: true`, this makes a message that
+  *asks* for a lookup ("research the two Atlantic ridge earthquakes", "look up …",
+  "verify …") or asks a plainly time-sensitive question ("were there any M6+ quakes
+  yesterday?", "what's the latest on …?") run one by itself. The heuristic is
+  deliberately conservative and two-tier; ordinary conversation never triggers it.
+  Leave it off in deployments where callers are untrusted — see the security note in
+  the research section. Lookups started this way report `meta.research.trigger: "auto"`
+  instead of `"explicit"`.
 - `RESEARCH_KEYLESS_ENABLED` — enable the free, no-API-key providers (default `true`):
   general web search via the public DuckDuckGo / Bing results pages
   (`DUCKDUCKGO_WEB_API_URL` / `BING_WEB_API_URL`), then DuckDuckGo Instant Answers
@@ -172,6 +181,12 @@ What happens on a researched request:
    `RESEARCH_CONTEXT_CHAR_LIMIT` characters. The model is instructed to answer from the
    sources and cite them as `[1]`, `[2]`, … — and, for that request only, not to claim
    it has no information access (the stock chat persona otherwise says exactly that).
+   That block is also date-stamped in UTC ("Today is 2026-10-14 (UTC)") so relative
+   time in the question ("yesterday", "the past 30 days") resolves against *now*
+   rather than against the model's training cutoff, and citations are confined to the
+   numbered list: the model may not mint a marker, an archive or an agency that the
+   retrieved sources don't back, and may not narrate carrying out a search it didn't
+   ("I combed through USGS, EMSC and NOAA" is exactly what this forbids).
 3. The reply token cap is raised to `RESEARCH_MAX_TOKENS` for that call only. Ordinary
    requests keep the `250`-token default and the exact `{ response }` shape; a researched
    request additionally returns `meta.research`:
@@ -182,11 +197,18 @@ What happens on a researched request:
   "meta": {
     "research": {
       "requested": true,
+      "trigger": "explicit",        // "explicit" | "auto" (see RESEARCH_AUTO_TRIGGER)
       "status": "ok",               // "ok" | "unavailable" | "error"
       "provider": "tavily",
       "query": "What is happening with EV battery costs?",
       "cached": false,
-      "sources": [{ "title": "…", "url": "https://…" }]
+      "sources": [{ "title": "…", "url": "https://…" }],
+      "citations": {                // the reply's markers vs. the sources supplied
+        "sources": 1,
+        "used": [1],
+        "invalid": [],              // markers pointing at a source that doesn't exist
+        "uncited": false            // sources were supplied and none were cited
+      }
     }
   }
 }
@@ -195,9 +217,25 @@ What happens on a researched request:
 Failure is **fail-open**: if research is disabled, no provider is configured, the
 requested provider is unknown, or every provider errors/times out, the request still
 returns `200` with a normal chat reply and `meta.research.status` set to `"unavailable"`
-or `"error"` (with a key-free error summary) instead of failing the chat. Research
-results are never written into the user's stored character facts, and no provider API
-key ever appears in a response or log line.
+or `"error"` (with a key-free error summary) instead of failing the chat.
+
+Fail-open is not **fail-silent**, though. If the lookup was requested and returned
+nothing, the model is still sent a system message — the failure notice — telling it the
+lookup failed, that it has no retrieved material, that it must cite nothing, and that
+it must not claim or imply it searched, checked or combed any archive, feed or agency,
+nor state from memory whether a recent event did or didn't happen. Without that notice
+an unanswered "research this" reaches a chat model that improvises a research-shaped
+answer, complete with invented archive sweeps, invented negative results and invented
+`[1]`/`[2]` markers — a wrong answer wearing the costume of a checked one. The reply
+token cap is raised for the notice too (the honest answer needs the same room as a
+sourced one). On such a turn `meta.research.citations.sources` is `0`, so any citation
+marker in the reply is listed under `invalid` rather than shipped as if it pointed at
+something.
+
+The `citations` audit is diagnostic only — the reply text is returned unedited — and the
+local humanizer leaves `[n]` markers untouched, so what the audit counts is what the
+caller received. Research results are never written into the user's stored character
+facts, and no provider API key ever appears in a response or log line.
 
 Retrieved text is treated as **untrusted data**: it reaches the model inside a
 `<research_data>` block with instructions to cite it, never to follow instructions
@@ -206,7 +244,8 @@ fetches caller-supplied URLs, so the feature cannot be used as an SSRF proxy. No
 there is still no authentication on this endpoint — anyone who can call it can use
 `research: true`, which with a keyed provider spends your quota (and with keyless
 providers spends the operators' rate limits), so keep `RESEARCH_ENABLED=false` on
-deployments where callers are not trusted.
+deployments where callers are not trusted. `RESEARCH_AUTO_TRIGGER` widens that surface
+further (a message alone can start a lookup), so leave it off there too.
 
 Predictive modeling/forecasting is deliberately *not* part of Tier 1 — that is
 Tier 3. Tier 2 (next section) adds structured data and computed analysis.

@@ -16,6 +16,10 @@ const http = require('node:http');
 const {
   createResearchClient,
   formatResearchContext,
+  formatResearchFailureNotice,
+  auditCitations,
+  detectResearchIntent,
+  utcDateStamp,
   describeResearchError,
   ResearchError
 } = require('../research');
@@ -345,4 +349,89 @@ test('formatResearchContext numbers sources, caps size, and quarantines injected
   }, 800);
   assert.ok(capped.length <= 800, 'context stays within its character cap');
   assert.ok(capped.endsWith('</research_data>'));
+});
+
+// ---------- grounding: date, citation confinement, failure honesty ----------
+
+test('formatResearchContext stamps the current UTC date so relative time resolves to now', () => {
+  const now = new Date('2026-10-14T15:00:00Z');
+  const context = formatResearchContext({
+    provider: 'tavily',
+    query: 'q',
+    results: [{ title: 'Source One', url: 'https://example.com/1', snippet: 'Facts.' }]
+  }, 6000, now);
+
+  assert.match(context, /Today is 2026-10-14 \(UTC\)/);
+  assert.match(context, /never against your training data/);
+  // Citation markers are confined to the supplied list, and the
+  // "I combed through the archives" register is explicitly off-limits.
+  assert.match(context, /only material you may present as retrieved/);
+  assert.match(context, /I combed through/);
+  assert.match(context, /do not establish that a specific recent event did or did not happen/);
+  // The existing guarantees survive the extra framing.
+  assert.match(context, /Research mode is ON for this request only/);
+  assert.match(context, /\[1\] Source One/);
+  assert.ok(context.endsWith('</research_data>'));
+});
+
+test('utcDateStamp is UTC and zero-padded, and survives a bad clock argument', () => {
+  assert.equal(utcDateStamp(new Date('2026-01-05T23:59:00Z')), '2026-01-05');
+  assert.equal(utcDateStamp(new Date('2026-01-05T00:30:00-05:00')), '2026-01-05');
+  assert.match(utcDateStamp('not a date'), /^\d{4}-\d{2}-\d{2}$/);
+});
+
+test('formatResearchFailureNotice forbids inventing a lookup that did not happen', () => {
+  const notice = formatResearchFailureNotice(
+    'Research provider "tavily" failed: socket hang up',
+    new Date('2026-10-14T00:00:00Z')
+  );
+
+  assert.match(notice, /the lookup FAILED/);
+  assert.match(notice, /Today is 2026-10-14/);
+  assert.match(notice, /cite nothing/);
+  assert.match(notice, /never say or imply that you searched/);
+  assert.match(notice, /socket hang up/);
+  // There are no sources, so there is no untrusted-data block to quarantine.
+  assert.ok(!notice.includes('<research_data>'));
+
+  // A missing reason still produces a usable notice.
+  const bare = formatResearchFailureNotice();
+  assert.match(bare, /the lookup FAILED/);
+  assert.ok(!bare.includes('Internal failure detail'));
+});
+
+test('auditCitations separates real citations from fabricated ones', () => {
+  assert.deepEqual(
+    auditCitations('Per [1] and [2], yes.', 2),
+    { sources: 2, used: [1, 2], invalid: [], uncited: false }
+  );
+  assert.deepEqual(
+    auditCitations('Per [1] and [7], yes.', 2),
+    { sources: 2, used: [1], invalid: [7], uncited: false }
+  );
+  assert.deepEqual(
+    auditCitations('No sources cited here.', 3),
+    { sources: 3, used: [], invalid: [], uncited: true }
+  );
+  // Zero sources (a failed lookup): every marker in the reply is fabricated.
+  assert.deepEqual(
+    auditCitations('Nothing since [1] in the past 30 days [2].', 0),
+    { sources: 0, used: [], invalid: [1, 2], uncited: false }
+  );
+  assert.deepEqual(auditCitations(null, 1), { sources: 1, used: [], invalid: [], uncited: true });
+});
+
+test('detectResearchIntent fires on explicit asks and time-sensitive questions only', () => {
+  // Explicit lookup verbs.
+  assert.equal(detectResearchIntent('research the two Atlantic ridge earthquakes'), true);
+  assert.equal(detectResearchIntent('look up the latest NXT card'), true);
+  assert.equal(detectResearchIntent('can you verify that claim?'), true);
+  // Time-sensitive questions.
+  assert.equal(detectResearchIntent('were there any M6+ quakes yesterday?'), true);
+  assert.equal(detectResearchIntent('what is the latest on the trade deadline?'), true);
+  // Ordinary conversation.
+  assert.equal(detectResearchIntent('hey, how was your day?'), false);
+  assert.equal(detectResearchIntent('I watched the news at the gym today'), false);
+  assert.equal(detectResearchIntent(''), false);
+  assert.equal(detectResearchIntent(undefined), false);
 });

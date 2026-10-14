@@ -45,3 +45,12 @@ test('trapped status skips phrase-dropping rewrites but still contracts', () => 
     "It's important to note that I'm not backing down."
   );
 });
+
+test('humanizer leaves citation markers pointing at the same sources', () => {
+  const input = 'It is important to note that I am not guessing here: the ridge slipped twice [1], and I will cite it again [12] below.';
+
+  assert.equal(
+    humanizeText(input),
+    "I'm not guessing here: the ridge slipped twice [1], and I'll cite it again [12] below."
+  );
+});

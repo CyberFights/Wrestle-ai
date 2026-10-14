@@ -46,6 +46,18 @@ Optional:
   Leave it off in deployments where callers are untrusted — see the security note in
   the research section. Lookups started this way report `meta.research.trigger: "auto"`
   instead of `"explicit"`.
+- `RESEARCH_NO_DATA_GUARD` — tell the model when no lookup ran (default `true`). Set to
+  `false` to restore the previous prompt exactly. With the guard on, a message that
+  reads like a request for current information ("research …", "the latest …",
+  "in the last 24 hours") but that started no lookup gets one extra system message
+  saying it has **no retrieved material** for this turn, that its training recall may be
+  stale, and that it must cite nothing, must not narrate a search it didn't perform,
+  must not report a negative result as verified, and must not offer to monitor or alert
+  on future events. It calls nothing and costs nothing — which is the point, because
+  the alternative is a chat model improvising exactly that answer with no failure
+  anywhere for the caller to notice. Ordinary conversation is not affected (the same
+  conservative detector as `RESEARCH_AUTO_TRIGGER` decides), and the notice explicitly
+  leaves in-character conversation, opinions and roleplay unrestricted.
 - `RESEARCH_KEYLESS_ENABLED` — enable the free, no-API-key providers (default `true`):
   general web search via the public DuckDuckGo / Bing results pages
   (`DUCKDUCKGO_WEB_API_URL` / `BING_WEB_API_URL`), then DuckDuckGo Instant Answers
@@ -236,6 +248,18 @@ The `citations` audit is diagnostic only — the reply text is returned unedited
 local humanizer leaves `[n]` markers untouched, so what the audit counts is what the
 caller received. Research results are never written into the user's stored character
 facts, and no provider API key ever appears in a response or log line.
+
+The failure notice covers a lookup that **ran and returned nothing**. The commoner case
+is that no lookup ran at all: research is opt-in, so a message like "research the two
+Atlantic ridge earthquakes" — an explicit request to a human reader, an ordinary string
+to this API — reaches the model with no sources and no instruction about sourcing
+unless the client sends `research: true` or `RESEARCH_AUTO_TRIGGER` is on. That turn
+gets the same treatment: `RESEARCH_NO_DATA_GUARD` (default `true`) injects a notice
+telling the model it has no retrieved material, so it says so instead of inventing an
+archive sweep, a negative result and citations. This is the only guard that is on by
+default, because it makes no network call. Belt and braces: turn on
+`RESEARCH_AUTO_TRIGGER` (or send `research: true`) so the lookup actually happens, and
+leave `RESEARCH_NO_DATA_GUARD` on for the turns where it can't or doesn't.
 
 Retrieved text is treated as **untrusted data**: it reaches the model inside a
 `<research_data>` block with instructions to cite it, never to follow instructions

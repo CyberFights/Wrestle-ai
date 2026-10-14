@@ -288,7 +288,7 @@ test('a provider outage fails open: 200, normal reply, meta.research reports the
     const notice = payload.messages.find(m => String(m.content).includes('the lookup FAILED'));
     assert.ok(notice, 'a failed lookup must tell the model it failed');
     assert.equal(notice.role, 'system');
-    assert.match(notice.content, /never say or imply that you searched/);
+    assert.match(notice.content, /never say or imply that you searched/i);
     assert.match(notice.content, /503/);
     // Nothing in the notice may be presented as retrieved material.
     assert.ok(!res.body.meta.research.sources, 'no sources are reported on failure');

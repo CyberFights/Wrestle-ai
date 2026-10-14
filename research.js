@@ -910,6 +910,29 @@ function formatResearchContext(result, maxContextChars = 6000, now = new Date())
 }
 
 /*
+ * The rules shared by both no-source notices. These are the specific
+ * behaviours a model without retrieved material has to be talked out of,
+ * observed one at a time in the wild:
+ *
+ *   - inventing citation markers [1]/[2] that point at nothing;
+ *   - narrating an archive review it never performed ("I combed through
+ *     USGS, EMSC and NOAA");
+ *   - reporting a fabricated *negative* result ("no 6.7 or 6.8 quakes in the
+ *     last 24 hours") — the most damaging shape, because a confident
+ *     no-result is what a real checked answer often looks like;
+ *   - offering to monitor or alert on future events, which no chat model can
+ *     do between conversations;
+ *   - restating years-old training recall as if it were current.
+ */
+const NO_SOURCE_RULES = [
+  'Cite nothing: no [1]/[2] markers, no URLs, and no source, outlet, agency or archive names.',
+  'Never say or imply that you searched, checked, combed, monitored or consulted any database, feed, archive, agency or website.',
+  'Do not state that a recent event did or did not happen, or give its magnitude, date, time or location from memory — and do not report a negative result ("nothing in the last 24 hours", "no 6.0+ events", "the largest was …") as if it were verified.',
+  'Never offer to monitor, watch, track, alert or notify about future events: you cannot do that between conversations, and promising it misrepresents your capability.',
+  'Anything you recall from training may be years out of date: mark it plainly as unverified recollection that may be stale, or leave it out.'
+];
+
+/*
  * The other half of fail-open.
  *
  * Research is allowed to fail without failing the chat (a missing key, a
@@ -930,9 +953,35 @@ function formatResearchFailureNotice(reason, now = new Date()) {
   return [
     'Research mode was ON for this request, but the lookup FAILED: no sources were retrieved, so you have NO retrieved material for this turn.',
     `Today is ${utcDateStamp(now)} (UTC). Anything you recall from training may be years out of date.`,
-    'Required behaviour for this reply: (1) tell the user plainly that the lookup failed and that you could not retrieve live sources; (2) cite nothing — no [1]/[2] markers, no URLs, no source, outlet, agency or archive names; (3) never say or imply that you searched, checked, combed, monitored or consulted any database, feed, archive, agency or website; (4) do not state that a recent event did or did not happen, or give its magnitude, date or location from memory; (5) offer to try again instead. You may add clearly-labelled background from your own knowledge only when it is not time-sensitive, and you must mark it as unverified recollection that may be out of date.',
+    'Required behaviour for this reply: (1) tell the user plainly that the lookup failed and that you could not retrieve live sources; (2) then offer to try again. Do not answer the time-sensitive part of the question from memory.',
+    ...NO_SOURCE_RULES,
     detail ? `Internal failure detail (context for you only — never quote or name it to the user): ${detail}` : ''
   ].filter(Boolean).join('\n');
+}
+
+/*
+ * The gap the failure notice does NOT cover: no lookup was ever requested.
+ *
+ * Research is opt-in, so the commonest path by far is that nothing ran at
+ * all. A user types "research the two Atlantic ridge earthquakes" into a chat
+ * box — an explicit request to a human reader, an ordinary string to the API
+ * — and, unless the operator enabled RESEARCH_AUTO_TRIGGER or the client
+ * sends `research: true`, the model is reached with no sources AND no
+ * instruction about sourcing. It then produces the answer this notice exists
+ * to prevent, with no failure anywhere for the caller to notice.
+ *
+ * So when the message reads like a request for current information and no
+ * material was retrieved, say exactly that to the model. It costs nothing and
+ * calls nothing, which is why it can safely be on by default.
+ */
+function formatNoLiveDataNotice(now = new Date()) {
+  return [
+    'No live lookup ran for this request, so you have NO retrieved material for this turn.',
+    `Today is ${utcDateStamp(now)} (UTC). Your training data ends well before this date, so anything time-sensitive you recall may already be out of date.`,
+    'The user\'s message asks for current, recent or externally checkable information ("latest", "recently", "yesterday", "so far", a specific year, a named event or magnitude). Required behaviour: (1) say plainly that you have no live data access on this turn and that your information may be out of date; (2) do not answer that part from memory; (3) offer to look it up with research enabled, or point the user at the official source, instead of guessing.',
+    'This applies to factual claims about the real world only. It does not restrict in-character conversation, opinions, banter or roleplay — answer those normally and in persona.',
+    ...NO_SOURCE_RULES
+  ].join('\n');
 }
 
 /*
@@ -982,7 +1031,10 @@ function auditCitations(text, sourceCount) {
  *     question, so "the news was on at the gym" is not a lookup.
  */
 const RESEARCH_LOOKUP_VERBS = /\b(?:research|look\s?up|search(?:\s+(?:for|up))?|google|fact[\s-]?check|double[\s-]?check|verify|cross[\s-]?reference|cite|sources?)\b/i;
-const RESEARCH_TIME_MARKERS = /\b(?:latest|newest|most recent|recent(?:ly)?|current(?:ly)?|right now|today|tonight|yesterday|tomorrow|this (?:week|month|year|morning|afternoon|evening)|last (?:night|week|month|year)|past \d+ (?:days?|weeks?|months?|years?)|next (?:week|month|year)|breaking|news|headline[sd]?|update[sd]?|as of|so far|live|real[\s-]?time|up[\s-]?to[\s-]?date|just (?:happened|now|in)|20\d\d)\b/i;
+// "last 24 hours" and "past 30 days" are the phrasings these questions
+// actually arrive in, so a counted window ("last | past | next" + a number +
+// a unit) is a marker in its own right.
+const RESEARCH_TIME_MARKERS = /\b(?:latest|newest|most recent|recent(?:ly)?|current(?:ly)?|right now|today|tonight|yesterday|tomorrow|this (?:week|month|year|morning|afternoon|evening)|last (?:night|week|month|year)|(?:last|past|next) \d+ (?:minutes?|hours?|days?|weeks?|months?|years?|decades?)|next (?:week|month|year)|breaking|news|headline[sd]?|update[sd]?|as of|so far|real[\s-]?time|up[\s-]?to[\s-]?date|just (?:happened|now|in)|20\d\d)\b/i;
 const RESEARCH_QUESTION_FORM = /\?|\b(?:what|when|where|which|who|whom|whose|why|how(?:\s+(?:many|much|long|often|big|strong))?|is there|are there|was there|were there|any|did|does|do|has|have)\b/i;
 
 function detectResearchIntent(text) {
@@ -996,6 +1048,7 @@ module.exports = {
   createResearchClient,
   formatResearchContext,
   formatResearchFailureNotice,
+  formatNoLiveDataNotice,
   auditCitations,
   detectResearchIntent,
   utcDateStamp,

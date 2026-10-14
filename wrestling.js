@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
-const { createResearchClient, formatResearchContext, formatResearchFailureNotice, auditCitations, detectResearchIntent, describeResearchError } = require('./research');
+const { createResearchClient, formatResearchContext, formatResearchFailureNotice, formatNoLiveDataNotice, auditCitations, detectResearchIntent, describeResearchError } = require('./research');
 const {
   createDataClient,
   analyzeDataset,
@@ -49,6 +49,11 @@ const RESEARCH_MAX_TOKENS = parsePositiveInt(process.env.RESEARCH_MAX_TOKENS, 80
 // research on by itself. Off by default — no deployment gets surprise network
 // calls or surprise provider costs unless it asks for them.
 const RESEARCH_AUTO_TRIGGER = parseOptionalBoolean(process.env.RESEARCH_AUTO_TRIGGER, false);
+// The no-lookup counterpart, on by default because it costs nothing: when a
+// message reads like a request for current information and no lookup ran, the
+// model is told it has no retrieved material — instead of being left to
+// improvise a research-shaped answer from memory. See formatNoLiveDataNotice.
+const RESEARCH_NO_DATA_GUARD = parseOptionalBoolean(process.env.RESEARCH_NO_DATA_GUARD, true);
 
 // Opt-in Tier 2 data analysis for /wrestling_chat (see dataAnalysis.js):
 // structured datasets (World Bank / REST Countries / caller-supplied rows)
@@ -1012,6 +1017,21 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
     messages.push({ role: 'system', content: researchSystemMessage });
   }
 
+  // The gap the failure notice does not cover, and the commonest path of all:
+  // no lookup was requested, so nothing ran and nothing came back. A message
+  // like "research the two Atlantic ridge earthquakes" reads as an explicit
+  // request to the user but is an ordinary string to this API — and with
+  // RESEARCH_AUTO_TRIGGER off (the default) it reaches the model with no
+  // sources and no instruction about sourcing. That is the state in which a
+  // chat model invents the archive sweep, the negative result and the
+  // citations. Telling it plainly that no lookup ran costs no network call,
+  // which is why this guard is on by default.
+  let noLiveDataNotice = '';
+  if (!researchRequested && RESEARCH_NO_DATA_GUARD && detectResearchIntent(userMessage)) {
+    noLiveDataNotice = formatNoLiveDataNotice();
+    messages.push({ role: 'system', content: noLiveDataNotice });
+  }
+
   // Opt-in data analysis (Tier 2) and predictive modeling (Tier 3) share
   // one dataset resolution: resolve the dataset (structured provider or
   // inline rows), compute every number locally, and inject only those
@@ -1125,10 +1145,11 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
     // Enhanced (research/analysis/forecast) replies need more room than the
     // 250-token chat default; only the token cap changes, and only on
     // requests that asked for one of the enhanced modes. A forecast-refusal
-    // block counts: the model needs room to explain the refusal. So does a
-    // research-failure notice — the honest "I could not retrieve anything"
-    // reply needs the same room as a sourced one.
-    const rawReply = (researchSystemMessage || analysisContext || forecastContext)
+    // block counts: the model needs room to explain the refusal. So do the
+    // research notices — an honest "I could not retrieve anything" reply, or
+    // an in-persona "I can't check live data, here's what I can offer", needs
+    // the same room as a sourced one.
+    const rawReply = (researchSystemMessage || noLiveDataNotice || analysisContext || forecastContext)
       ? await mistral.chat(messages, { max_tokens: RESEARCH_MAX_TOKENS })
       : await mistral.chat(messages);
     const botReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;

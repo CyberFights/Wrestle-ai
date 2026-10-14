@@ -17,6 +17,7 @@ const {
   createResearchClient,
   formatResearchContext,
   formatResearchFailureNotice,
+  formatNoLiveDataNotice,
   auditCitations,
   detectResearchIntent,
   utcDateStamp,
@@ -388,8 +389,8 @@ test('formatResearchFailureNotice forbids inventing a lookup that did not happen
 
   assert.match(notice, /the lookup FAILED/);
   assert.match(notice, /Today is 2026-10-14/);
-  assert.match(notice, /cite nothing/);
-  assert.match(notice, /never say or imply that you searched/);
+  assert.match(notice, /cite nothing/i);
+  assert.match(notice, /never say or imply that you searched/i);
   assert.match(notice, /socket hang up/);
   // There are no sources, so there is no untrusted-data block to quarantine.
   assert.ok(!notice.includes('<research_data>'));
@@ -434,4 +435,28 @@ test('detectResearchIntent fires on explicit asks and time-sensitive questions o
   assert.equal(detectResearchIntent('I watched the news at the gym today'), false);
   assert.equal(detectResearchIntent(''), false);
   assert.equal(detectResearchIntent(undefined), false);
+});
+
+test('formatNoLiveDataNotice tells the model it has no sources when no lookup ran', () => {
+  const notice = formatNoLiveDataNotice(new Date('2026-10-14T15:00:00Z'));
+
+  assert.match(notice, /No live lookup ran for this request/);
+  assert.match(notice, /Today is 2026-10-14 \(UTC\)/);
+  assert.match(notice, /no live data access on this turn/i);
+  // The three moves from the incident, each named so the model can't drift
+  // into it: the archive sweep, the confident negative result, and the
+  // promise to monitor the fault line forever.
+  assert.match(notice, /Never say or imply that you searched/i);
+  assert.match(notice, /do not report a negative result/i);
+  assert.match(notice, /Never offer to monitor, watch, track, alert or notify/i);
+  // And the reassurance that keeps a roleplay persona intact.
+  assert.match(notice, /does not restrict in-character conversation/i);
+  assert.ok(!notice.includes('<research_data>'));
+});
+
+test('detectResearchIntent understands counted windows like "last 24 hours"', () => {
+  assert.equal(detectResearchIntent('were there any earthquakes on the ridge in the last 24 hours?'), true);
+  assert.equal(detectResearchIntent('what happened on the ridge in the past 30 days?'), true);
+  // Bare "live" used to be a marker; "where do you live?" is ordinary chat.
+  assert.equal(detectResearchIntent('where do you live?'), false);
 });

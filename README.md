@@ -65,7 +65,8 @@ Optional:
   attached. Both notices therefore state that earlier turns of the conversation are not
   a source either.
 - `RESEARCH_KEYLESS_ENABLED` — enable the free, no-API-key providers (default `true`):
-  general web search via the public DuckDuckGo / Bing results pages
+  the USGS earthquake catalog (`USGS_API_URL`), general web search via the public
+  DuckDuckGo / Bing results pages
   (`DUCKDUCKGO_WEB_API_URL` / `BING_WEB_API_URL`), then DuckDuckGo Instant Answers
   (`DUCKDUCKGO_API_URL`), Wikipedia (`WIKIPEDIA_API_URL`) and OpenAlex
   (`OPENALEX_API_URL`, plus optional `OPENALEX_MAILTO` for its polite pool — a
@@ -83,8 +84,11 @@ Optional:
   API key for a keyed web-search provider. None is required (see the keyless providers
   above); a configured keyed provider is tried *first* because its extracted full-text
   results are richer. `RESEARCH_PROVIDERS` sets the try-order (default
-  `tavily,brave,exa,serper,duckduckgo_web,bing_web,duckduckgo,wikipedia,openalex`);
-  on failure the next configured provider is tried. The matching `TAVILY_API_URL`,
+  `usgs,tavily,brave,exa,serper,duckduckgo_web,bing_web,duckduckgo,wikipedia,openalex`);
+  on failure the next configured provider is tried. `usgs` leads the order because it is
+  the only first-party catalog in the chain, and it is skipped for any query that is not
+  about earthquakes (`PROVIDER_ADAPTERS.usgs.when`) — so a seismic question gets the real
+  feed while general research is untouched. The matching `TAVILY_API_URL`,
   `BRAVE_SEARCH_API_URL`, `EXA_API_URL` and `SERPER_API_URL` variables override
   the provider endpoints (e.g. for a proxy).
 - `RESEARCH_TIMEOUT_MS` — per-provider research timeout (default `5000`). Research adds
@@ -194,12 +198,26 @@ await fetch(`${apiUrl}/wrestling_chat`, {
 
 What happens on a researched request:
 
-1. Providers are queried in `RESEARCH_PROVIDERS` order (keyed providers with a
-   configured key first, then the keyless DuckDuckGo web → Bing web → DuckDuckGo
-   Instant Answers → Wikipedia → OpenAlex chain); on failure — or an empty
-   result, which a no-match or bot-challenged results page produces — the next
-   provider is tried. Use `research_provider: 'wikipedia'` (etc.) to pin one.
+1. Providers are queried in `RESEARCH_PROVIDERS` order (the USGS catalog for seismic
+   queries, then keyed providers with a configured key, then the keyless DuckDuckGo
+   web → Bing web → DuckDuckGo Instant Answers → Wikipedia → OpenAlex chain); on failure
+   — or an empty result, which a no-match or bot-challenged results page produces — the
+   next provider is tried. Use `research_provider: 'wikipedia'` (etc.) to pin one.
    Identical queries are cached in-process for `RESEARCH_CACHE_TTL_MS`.
+
+   The `usgs` provider is the one that does not search the web. It queries the keyless
+   USGS FDSN event catalog and translates the question into catalog parameters
+   conservatively: a stated magnitude and window are honoured ("magnitude 6.0+ in the
+   last 24 hours"), unstated ones default to M4.5+ over 30 days, and named regions
+   (Mid-Atlantic Ridge, Reykjanes, Azores, Iceland) become bounding boxes. Each event
+   arrives as quotable data — magnitude, depth, origin time, review status and its
+   `earthquake.usgs.gov` event page — so those numbers come from the catalog rather than
+   from the model's memory of a headline. An **empty catalog result is a result**: "no
+   events matched (M6+, the Mid-Atlantic Ridge, the last 24 hours)" is returned as one
+   checkable entry (linked to the query itself) instead of falling through to scrapers
+   that know nothing about earthquakes — that negative result is exactly what the model
+   had been inventing, and this is the verified version of it. See
+   `test/usgsProvider.test.js`.
 2. The top results are normalized to `{ title, url, snippet }` and injected into the
    existing Mistral call as one extra system message, capped at
    `RESEARCH_CONTEXT_CHAR_LIMIT` characters. The model is instructed to answer from the

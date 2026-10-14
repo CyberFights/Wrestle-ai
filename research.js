@@ -61,6 +61,11 @@ const axios = require('axios');
 // they are always configured, so this order gives every deployment a working
 // fallback chain while preferring paid quality when a key exists.
 const DEFAULT_PROVIDER_ORDER = [
+  // The one first-party catalog in the chain. It answers exactly one domain —
+  // earthquakes — and is skipped for everything else (see PROVIDER_ADAPTERS
+  // .usgs.when), so putting it first means a seismic query gets the real feed
+  // instead of whatever a scraper thinks the results page says.
+  'usgs',
   'tavily', 'brave', 'exa', 'serper',
   // General web search first among the keyless providers (see header):
   // the Instant Answer / Wikipedia / OpenAlex APIs below them cannot
@@ -70,6 +75,7 @@ const DEFAULT_PROVIDER_ORDER = [
 ];
 
 const DEFAULT_URLS = {
+  usgs: 'https://earthquake.usgs.gov/fdsnws/event/1/query',
   tavily: 'https://api.tavily.com/search',
   brave: 'https://api.search.brave.com/res/v1/web/search',
   exa: 'https://api.exa.ai/search',
@@ -86,6 +92,7 @@ const DEFAULT_URLS = {
 // call with no key, no signup and no account — so it is configured purely
 // from its (optional) endpoint override.
 const PROVIDER_ENV = {
+  usgs: { key: null, url: 'USGS_API_URL' },
   tavily: { key: 'TAVILY_API_KEY', url: 'TAVILY_API_URL' },
   brave: { key: 'BRAVE_SEARCH_API_KEY', url: 'BRAVE_SEARCH_API_URL' },
   exa: { key: 'EXA_API_KEY', url: 'EXA_API_URL' },
@@ -376,7 +383,192 @@ function resolveBingUrl(href) {
 // the (provider-specific) payload onto { title, url, snippet, publishedDate }.
 // `requiresKey` separates keyed providers (skipped until a key is configured)
 // from keyless ones (always available, subject to RESEARCH_KEYLESS_ENABLED).
+/*
+ * USGS earthquake catalog (FDSN event API) — the one provider in the chain that
+ * does not search the web at all.
+ *
+ * It exists because of what a general web-search chain does with a seismic
+ * question. Asked for "all Mid-Atlantic Ridge earthquakes in the last 30 days",
+ * the keyless chain returned Wikipedia, YouTube, a celebrity magazine and a
+ * language-learning site — the model dutifully reported that none of those
+ * contained any earthquake data, which is honest but useless. The catalog
+ * answer was one keyless, no-signup JSON request away.
+ *
+ * Keyless like the rest of the free providers, and deliberately narrow:
+ * `when` keeps it out of every query that is not about earthquakes, and the
+ * query text is translated into catalog parameters conservatively — unstated
+ * magnitude defaults to M4.5+, unstated window to 30 days, and an unstated
+ * region to worldwide, which is exactly the ask "all ... earthquakes".
+ *
+ * A catalog that returns zero events is a RESULT, not a failure: it is
+ * reported as one checkable entry instead of falling through to the scrapers,
+ * because "USGS matched no events for M6+, Mid-Atlantic Ridge, last 24 hours"
+ * is the verified negative result the model has been inventing for four
+ * answers — minus the invention.
+ */
+const USGS_SEISMIC_QUERY = /\b(?:earthquakes?|quakes?|seismic|seismicity|tremors?|aftershocks?|foreshocks?|magnitude|richter|epicent(?:er|re)s?|fault\s?line|tectonic)\b|\bm\s?\d(?:\.\d+)?\b/i;
+// An adapter may declare itself inapplicable to a query ("USGS answers seismic
+// questions and nothing else"), which keeps a narrow first-party provider from
+// displacing general web search for ordinary research.
+function providerApplies(name, query) {
+  const adapter = PROVIDER_ADAPTERS[name];
+  if (!adapter || typeof adapter.when !== 'function') return true;
+  return adapter.when(query);
+}
+
+const USGS_DEFAULT_MIN_MAGNITUDE = 4.5;
+const USGS_DEFAULT_WINDOW_DAYS = 30;
+const USGS_MAX_LIMIT = 200;
+
+// Bounding boxes are the ones used to verify the incidents in this repo's
+// history: the ridge corridor spanning Reykjanes to the southern MAR, plus the
+// sub-regions a question usually names.
+const USGS_REGIONS = [
+  { pattern: /\breykjanes\b/i, minlatitude: 59, maxlatitude: 67, minlongitude: -30, maxlongitude: -12, label: 'the Reykjanes Ridge' },
+  { pattern: /\bazores\b/i, minlatitude: 35, maxlatitude: 41, minlongitude: -32, maxlongitude: -22, label: 'the Azores region' },
+  { pattern: /\biceland\b/i, minlatitude: 62, maxlatitude: 68, minlongitude: -25, maxlongitude: -13, label: 'Iceland' },
+  { pattern: /\bmid[\s-]?atlantic\s+ridge\b|\batlantic\s+ridge\b|\bmar\b/i, minlatitude: -40, maxlatitude: 56, minlongitude: -45, maxlongitude: 10, label: 'the Mid-Atlantic Ridge' }
+];
+
+const USGS_UNIT_MS = {
+  minute: 60000,
+  hour: 3600000,
+  day: 86400000,
+  week: 604800000,
+  month: 2592000000,
+  year: 31536000000
+};
+
+function usgsRegion(query) {
+  const text = String(query || '');
+  for (const region of USGS_REGIONS) {
+    if (region.pattern.test(text)) return region;
+  }
+  return null;
+}
+
+function usgsMinMagnitude(query) {
+  const text = String(query || '');
+  const match = text.match(/\b(?:magnitude|mag\.?|m)\s?(\d(?:\.\d+)?)\s*(?:\+|plus)\b/i)
+    || text.match(/\b(?:magnitude|mag\.?)\s?(\d(?:\.\d+)?)\b/i)
+    || text.match(/\b(\d(?:\.\d+)?)\s*(?:\+|plus)\s*(?:quakes?|earthquakes?|events?|magnitude)\b/i);
+  if (!match) return USGS_DEFAULT_MIN_MAGNITUDE;
+  const value = parseFloat(match[1]);
+  return Number.isFinite(value) && value > 0 && value <= 10 ? value : USGS_DEFAULT_MIN_MAGNITUDE;
+}
+
+function usgsWindow(query, now = new Date()) {
+  const end = new Date(now.getTime());
+  const text = String(query || '');
+  const counted = text.match(/\b(?:last|past|previous|prior|trailing)\s+(\d+)\s*(minutes?|hours?|days?|weeks?|months?|years?)\b/i);
+  if (counted) {
+    const n = parseInt(counted[1], 10);
+    const unit = counted[2].toLowerCase().replace(/s$/, '');
+    const ms = USGS_UNIT_MS[unit] || USGS_UNIT_MS.day;
+    return { start: new Date(end.getTime() - n * ms), end, label: `${n} ${unit}${n === 1 ? '' : 's'}` };
+  }
+  const named = text.match(/\b(today|yesterday|this week|this month|this year|tonight)\b/i);
+  if (named) {
+    const key = named[1].toLowerCase();
+    const days = { today: 1, tonight: 1, yesterday: 2, 'this week': 7, 'this month': 30, 'this year': 365 }[key];
+    return { start: new Date(end.getTime() - days * USGS_UNIT_MS.day), end, label: `the ${key} window (${days} days)` };
+  }
+  return { start: new Date(end.getTime() - USGS_DEFAULT_WINDOW_DAYS * USGS_UNIT_MS.day), end, label: `the last ${USGS_DEFAULT_WINDOW_DAYS} days` };
+}
+
+// "M 6.8 - central Mid-Atlantic Ridge" → one line the model can quote, with the
+// origin time and depth attached so magnitude/depth/time all come from the
+// catalog rather than from the model's memory of a headline.
+function usgsEventTitle(properties, isoTime) {
+  const base = cleanText(properties.title, 200) || `M ${properties.mag}`;
+  return `${base} — ${isoTime}`;
+}
+
+function usgsEventSnippet(properties, isoTime, depthKm) {
+  const parts = [
+    `Magnitude ${properties.mag}${properties.magType ? ` (${properties.magType})` : ''}`,
+    `origin time ${isoTime}`,
+    Number.isFinite(depthKm) ? `depth ${depthKm} km` : null,
+    properties.place ? `location ${cleanText(properties.place, 200)}` : null,
+    properties.tsunami ? 'tsunami flag set in the catalog' : null,
+    properties.alert ? `USGS alert level ${properties.alert}` : null,
+    properties.status ? `review status ${properties.status}` : null
+  ];
+  return `${parts.filter(Boolean).join('; ')}.`;
+}
+
 const PROVIDER_ADAPTERS = {
+  usgs: {
+    requiresKey: false,
+    // Only ever answers seismic questions; skipped for anything else.
+    when: query => USGS_SEISMIC_QUERY.test(String(query || '')),
+    buildRequest(query, maxResults, config) {
+      const window = usgsWindow(query);
+      const region = usgsRegion(query);
+      const limit = Math.max(1, Math.min(Number(maxResults) || 10, USGS_MAX_LIMIT));
+      const params = {
+        format: 'geojson',
+        starttime: window.start.toISOString(),
+        endtime: window.end.toISOString(),
+        minmagnitude: usgsMinMagnitude(query),
+        eventtype: 'earthquake',
+        orderby: /\b(?:biggest|largest|strongest|most powerful|highest magnitude)\b/i.test(String(query || ''))
+          ? 'magnitude'
+          : 'time',
+        limit
+      };
+      if (region) {
+        params.minlatitude = region.minlatitude;
+        params.maxlatitude = region.maxlatitude;
+        params.minlongitude = region.minlongitude;
+        params.maxlongitude = region.maxlongitude;
+      }
+      return {
+        method: 'get',
+        url: config.url,
+        params,
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': config.userAgent
+        }
+      };
+    },
+    parse(data, context = {}) {
+      const features = Array.isArray(data?.features) ? data.features : [];
+      const results = features.map(feature => {
+        const properties = feature?.properties || {};
+        const coordinates = Array.isArray(feature?.geometry?.coordinates) ? feature.geometry.coordinates : [];
+        const time = Number(properties.time);
+        const isoTime = Number.isFinite(time)
+          ? `${new Date(time).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+          : '';
+        return {
+          title: usgsEventTitle(properties, isoTime).trim(),
+          url: cleanText(properties.url, 1000) || cleanText(data?.metadata?.url, 1000),
+          snippet: usgsEventSnippet(properties, isoTime, coordinates[2]),
+          publishedDate: isoTime ? isoTime.slice(0, 10) : undefined
+        };
+      });
+
+      if (results.length) return results;
+
+      // A zero-match catalog query is a finding, not a dead end: report it as
+      // one verifiable entry (the query URL is clickable) instead of letting
+      // the chain fall through to scrapers that know nothing about earthquakes.
+      const window = usgsWindow(context.query);
+      const region = usgsRegion(context.query);
+      const minMagnitude = usgsMinMagnitude(context.query);
+      const where = region ? region.label : 'worldwide';
+      const link = cleanText(data?.metadata?.url, 1000)
+        || 'https://earthquake.usgs.gov/earthquakes/search/';
+      return [{
+        title: `USGS earthquake catalog: no events matched (M${minMagnitude}+, ${where}, ${window.label})`,
+        url: link,
+        snippet: `The USGS FDSN event catalog returned ${Number(data?.metadata?.count) || 0} earthquakes for magnitude ${minMagnitude} and above, ${where}, ${window.label} (${window.start.toISOString().slice(0, 10)} to ${window.end.toISOString().slice(0, 10)}). This is the catalog's answer for those parameters, not a failed lookup.`,
+        publishedDate: window.end.toISOString().slice(0, 10)
+      }];
+    }
+  },
   tavily: {
     requiresKey: true,
     buildRequest(query, maxResults, config) {
@@ -775,7 +967,7 @@ function createResearchClient(options = {}) {
 
     const candidates = requestedProvider
       ? (configured[requestedProvider] ? [requestedProvider] : [])
-      : providerOrder.filter(name => configured[name]);
+      : providerOrder.filter(name => configured[name] && providerApplies(name, query));
 
     if (!candidates.length) {
       throw new ResearchError(
@@ -802,7 +994,7 @@ function createResearchClient(options = {}) {
         // Not every endpoint honors the requested count (a results page
         // returns as many as it returns), so the cap is enforced here,
         // once, for every provider.
-        const results = normalizeResults(adapter.parse(response?.data)).slice(0, maxResults);
+        const results = normalizeResults(adapter.parse(response?.data, { query, maxResults })).slice(0, maxResults);
         if (!results.length) {
           throw new ResearchError('RESEARCH_EMPTY', `Research provider "${name}" returned no usable results.`);
         }

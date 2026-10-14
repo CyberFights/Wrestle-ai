@@ -38,20 +38,28 @@ Optional:
   (default `true`). Research only ever runs when a request explicitly asks for it;
   set to `false` to disable it server-wide.
 - `RESEARCH_KEYLESS_ENABLED` — enable the free, no-API-key providers (default `true`):
-  DuckDuckGo Instant Answers (`DUCKDUCKGO_API_URL`), Wikipedia (`WIKIPEDIA_API_URL`)
-  and OpenAlex (`OPENALEX_API_URL`, plus optional `OPENALEX_MAILTO` for its polite
-  pool — a contact email, not a key). With these on, research works with **no keys,
-  no signup and no account**. Keyless results are best-effort (DuckDuckGo only
-  answers some queries, hence the fallback chain) and rate-limited by the operators;
-  `RESEARCH_USER_AGENT` overrides the identifying header they are sent.
+  general web search via the public DuckDuckGo / Bing results pages
+  (`DUCKDUCKGO_WEB_API_URL` / `BING_WEB_API_URL`), then DuckDuckGo Instant Answers
+  (`DUCKDUCKGO_API_URL`), Wikipedia (`WIKIPEDIA_API_URL`) and OpenAlex
+  (`OPENALEX_API_URL`, plus optional `OPENALEX_MAILTO` for its polite pool — a
+  contact email, not a key). With these on, research works with **no keys, no
+  signup and no account**. Keyless results are best-effort (the results pages
+  can rate-limit or bot-challenge, hence the fallback chain); the Instant
+  Answers / Wikipedia / OpenAlex APIs alone are *not* general web search —
+  Instant Answers only answers some queries, Wikipedia only returns Wikipedia
+  articles and OpenAlex only papers — so they are last-resort fallbacks, not
+  the primary providers. `RESEARCH_USER_AGENT` overrides the identifying
+  header the API providers are sent (the results-page providers present a
+  browser user agent unless this is set, as those endpoints refuse
+  non-browser agents).
 - `TAVILY_API_KEY` / `BRAVE_SEARCH_API_KEY` / `EXA_API_KEY` / `SERPER_API_KEY` — optional
   API key for a keyed web-search provider. None is required (see the keyless providers
   above); a configured keyed provider is tried *first* because its extracted full-text
   results are richer. `RESEARCH_PROVIDERS` sets the try-order (default
-  `tavily,brave,exa,serper,duckduckgo,wikipedia,openalex`); on failure the next
-  configured provider is tried. The matching `TAVILY_API_URL`, `BRAVE_SEARCH_API_URL`,
-  `EXA_API_URL` and `SERPER_API_URL` variables override the provider endpoints
-  (e.g. for a proxy).
+  `tavily,brave,exa,serper,duckduckgo_web,bing_web,duckduckgo,wikipedia,openalex`);
+  on failure the next configured provider is tried. The matching `TAVILY_API_URL`,
+  `BRAVE_SEARCH_API_URL`, `EXA_API_URL` and `SERPER_API_URL` variables override
+  the provider endpoints (e.g. for a proxy).
 - `RESEARCH_TIMEOUT_MS` — per-provider research timeout (default `5000`). Research adds
   at most roughly this much latency to a researched request.
 - `RESEARCH_MAX_RESULTS` — default number of sources per research call (default `5`, max `10`).
@@ -125,11 +133,16 @@ move/stamina sanitizer, so the existing `your turn.` and move-limit rules still 
 research feature: live web search, retrieved sources injected into the model call, and
 citations back to those sources. It is **strictly opt-in**: nothing changes for existing
 callers, and no external API is called unless a single request explicitly asks for
-research. **No API key, signup, or account is needed**: keyless providers (DuckDuckGo
-Instant Answers, Wikipedia, OpenAlex) are enabled by default and work out of the box.
-Configuring a keyed provider (Tavily, Brave Search, Exa, or Serper) is optional and
-only upgrades result quality — keyed providers are tried first, keyless ones are the
-always-available fallback (see the `RESEARCH_*` environment variables above).
+research. **No API key, signup, or account is needed**: keyless providers are
+enabled by default and work out of the box — general web search first (the public
+DuckDuckGo and Bing results pages, `duckduckgo_web` / `bing_web`), with DuckDuckGo
+Instant Answers, Wikipedia and OpenAlex as fallbacks. Those three APIs are not a
+search engine on their own — Instant Answers returns nothing for most queries,
+Wikipedia only has Wikipedia articles and OpenAlex only papers — which is why the
+results-page providers lead the keyless chain. Configuring a keyed provider
+(Tavily, Brave Search, Exa, or Serper) is optional and only upgrades result
+quality — keyed providers are tried first, keyless ones are the always-available
+fallback (see the `RESEARCH_*` environment variables above).
 
 ```js
 await fetch(`${apiUrl}/wrestling_chat`, {
@@ -149,9 +162,10 @@ await fetch(`${apiUrl}/wrestling_chat`, {
 What happens on a researched request:
 
 1. Providers are queried in `RESEARCH_PROVIDERS` order (keyed providers with a
-   configured key first, then the keyless DuckDuckGo → Wikipedia → OpenAlex chain);
-   on failure — or an empty result, which DuckDuckGo returns for many queries — the
-   next provider is tried. Use `research_provider: 'wikipedia'` (etc.) to pin one.
+   configured key first, then the keyless DuckDuckGo web → Bing web → DuckDuckGo
+   Instant Answers → Wikipedia → OpenAlex chain); on failure — or an empty
+   result, which a no-match or bot-challenged results page produces — the next
+   provider is tried. Use `research_provider: 'wikipedia'` (etc.) to pin one.
    Identical queries are cached in-process for `RESEARCH_CACHE_TTL_MS`.
 2. The top results are normalized to `{ title, url, snippet }` and injected into the
    existing Mistral call as one extra system message, capped at

@@ -14,20 +14,32 @@
  * key is configured. Keyless providers need no key, no signup and no account,
  * and are available out of the box, so research works with zero configuration:
  *
- *   tavily      — TAVILY_API_KEY       (POST https://api.tavily.com/search)
- *   brave       — BRAVE_SEARCH_API_KEY (GET https://api.search.brave.com/res/v1/web/search)
- *   exa         — EXA_API_KEY          (POST https://api.exa.ai/search)
- *   serper      — SERPER_API_KEY       (POST https://google.serper.dev/search)
- *   duckduckgo  — keyless              (GET https://api.duckduckgo.com/)
- *   wikipedia   — keyless              (GET https://en.wikipedia.org/w/api.php)
- *   openalex    — keyless              (GET https://api.openalex.org/works)
+ *   tavily         — TAVILY_API_KEY       (POST https://api.tavily.com/search)
+ *   brave          — BRAVE_SEARCH_API_KEY (GET https://api.search.brave.com/res/v1/web/search)
+ *   exa            — EXA_API_KEY          (POST https://api.exa.ai/search)
+ *   serper         — SERPER_API_KEY       (POST https://google.serper.dev/search)
+ *   duckduckgo_web — keyless              (GET https://html.duckduckgo.com/html/)
+ *   bing_web       — keyless              (GET https://www.bing.com/search)
+ *   duckduckgo     — keyless              (GET https://api.duckduckgo.com/)
+ *   wikipedia      — keyless              (GET https://en.wikipedia.org/w/api.php)
+ *   openalex       — keyless              (GET https://api.openalex.org/works)
  *
  * Keyed providers are tried first (in RESEARCH_PROVIDERS order) because their
  * extracted full-text results are richer; the keyless providers are the
- * always-available fallback. Keyless search is best-effort: DuckDuckGo's
- * Instant Answer API only answers some queries (the chain then falls back to
- * Wikipedia and OpenAlex), and all three are rate-limited by the operators,
- * so a deployment expecting heavy research traffic should configure a key.
+ * always-available fallback. Keyless search is best-effort and rate-limited
+ * by the operators, so a deployment expecting heavy research traffic should
+ * configure a key. The two *_web providers are what make an ordinary
+ * Google-style query work with no key at all: they read the public HTML
+ * results pages of DuckDuckGo / Bing, i.e. a real general web index. The
+ * older keyless APIs underneath them are NOT general web search —
+ * DuckDuckGo's Instant Answer API only answers encyclopedic/definitional
+ * queries and returns empty fields for most others, Wikipedia only ever
+ * returns Wikipedia articles and OpenAlex only scholarly works — so on
+ * their own they report "no matching data" for exactly the queries a
+ * search engine answers easily. They stay in the chain as last-resort
+ * fallbacks (an encyclopedia article is better than nothing), and if a
+ * *_web endpoint is unreachable or answers with a bot challenge, its
+ * parser returns no results and the chain falls through in the same way.
  * RESEARCH_KEYLESS_ENABLED=false turns the keyless providers off.
  *
  * The *_API_URL env vars override the endpoints (used by the tests to point
@@ -50,6 +62,10 @@ const axios = require('axios');
 // fallback chain while preferring paid quality when a key exists.
 const DEFAULT_PROVIDER_ORDER = [
   'tavily', 'brave', 'exa', 'serper',
+  // General web search first among the keyless providers (see header):
+  // the Instant Answer / Wikipedia / OpenAlex APIs below them cannot
+  // answer a general query no matter how the chain orders them.
+  'duckduckgo_web', 'bing_web',
   'duckduckgo', 'wikipedia', 'openalex'
 ];
 
@@ -58,6 +74,8 @@ const DEFAULT_URLS = {
   brave: 'https://api.search.brave.com/res/v1/web/search',
   exa: 'https://api.exa.ai/search',
   serper: 'https://google.serper.dev/search',
+  duckduckgo_web: 'https://html.duckduckgo.com/html/',
+  bing_web: 'https://www.bing.com/search',
   duckduckgo: 'https://api.duckduckgo.com/',
   wikipedia: 'https://en.wikipedia.org/w/api.php',
   openalex: 'https://api.openalex.org/works'
@@ -72,6 +90,8 @@ const PROVIDER_ENV = {
   brave: { key: 'BRAVE_SEARCH_API_KEY', url: 'BRAVE_SEARCH_API_URL' },
   exa: { key: 'EXA_API_KEY', url: 'EXA_API_URL' },
   serper: { key: 'SERPER_API_KEY', url: 'SERPER_API_URL' },
+  duckduckgo_web: { key: null, url: 'DUCKDUCKGO_WEB_API_URL' },
+  bing_web: { key: null, url: 'BING_WEB_API_URL' },
   duckduckgo: { key: null, url: 'DUCKDUCKGO_API_URL' },
   wikipedia: { key: null, url: 'WIKIPEDIA_API_URL' },
   openalex: { key: null, url: 'OPENALEX_API_URL' }
@@ -80,6 +100,12 @@ const PROVIDER_ENV = {
 // Wikipedia and friends ask callers to identify themselves; the polite-pool
 // convention for OpenAlex is the same header (plus an optional mailto).
 const DEFAULT_USER_AGENT = 'Wrestle-ai/1.0 (opt-in research; https://github.com/CyberFights/Wrestle-ai)';
+
+// The public HTML results pages behind the *_web providers refuse or
+// bot-challenge non-browser user agents, so those two providers present a
+// browser UA unless the operator configured their own (RESEARCH_USER_AGENT
+// or an explicit per-provider userAgent always wins — see scraperUserAgent).
+const DEFAULT_SCRAPER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const MAX_QUERY_CHARS = 500;
 const MAX_SNIPPET_CHARS = 1500;
@@ -114,6 +140,8 @@ function parseBooleanEnv(value, fallback) {
 function normalizeProviderName(name) {
   const normalized = String(name || '').trim().toLowerCase().replace(/-/g, '_');
   if (normalized === 'brave_search') return 'brave';
+  if (['ddg', 'ddg_web', 'ddg_html', 'duckduckgo_html'].includes(normalized)) return 'duckduckgo_web';
+  if (['bing', 'bing_search', 'microsoft_bing'].includes(normalized)) return 'bing_web';
   return normalized;
 }
 
@@ -171,12 +199,15 @@ function describeResearchError(error) {
 function normalizeResults(rawResults) {
   if (!Array.isArray(rawResults)) return [];
   const results = [];
+  const seenUrls = new Set();
   for (const raw of rawResults) {
     if (!raw || typeof raw !== 'object') continue;
     const url = cleanText(raw.url, 1000);
     const title = cleanText(raw.title, 300) || url;
     const snippet = cleanText(raw.snippet || raw.content || raw.text, MAX_SNIPPET_CHARS);
     if (!url || (!title && !snippet)) continue;
+    if (seenUrls.has(url)) continue; // e.g. a DDG abstract repeated as a result
+    seenUrls.add(url);
     results.push({
       title,
       url,
@@ -187,9 +218,37 @@ function normalizeResults(rawResults) {
   return results;
 }
 
+// Decode the small set of HTML entities search pages actually emit in
+// titles, snippets and hrefs (&amp; in a redirect URL must reach the
+// caller as &, or the uddg/u parameter can never be read back out).
+function decodeHtmlEntities(value) {
+  return String(value == null ? '' : value)
+    .replace(/&#(x[0-9a-f]+|\d+);/gi, (match, code) => {
+      const codePoint = code[0].toLowerCase() === 'x'
+        ? parseInt(code.slice(1), 16)
+        : parseInt(code, 10);
+      return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
+        ? String.fromCodePoint(codePoint)
+        : match;
+    })
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&(mdash|ndash|hellip|lsquo|rsquo|ldquo|rdquo|copy|reg|trade|middot|laquo|raquo|deg);/gi,
+      (match, name) => ({
+        mdash: '—', ndash: '–', hellip: '…', lsquo: '‘', rsquo: '’',
+        ldquo: '“', rdquo: '”', copy: '©', reg: '®', trade: '™',
+        middot: '·', laquo: '«', raquo: '»', deg: '°'
+      }[name.toLowerCase()] || match))
+    // &amp; last: "&amp;lt;" is the literal text "&lt;", not "<".
+    .replace(/&amp;/gi, '&');
+}
+
 // DuckDuckGo result text can carry light HTML even with no_html=1.
 function stripTags(value) {
-  return String(value == null ? '' : value).replace(/<[^>]*>/g, ' ');
+  return decodeHtmlEntities(String(value == null ? '' : value).replace(/<[^>]*>/g, ' '));
 }
 
 // OpenAlex returns abstracts as an inverted index ({ word: [positions] }).
@@ -205,6 +264,112 @@ function openAlexAbstract(invertedIndex) {
     }
   }
   return words.filter(Boolean).join(' ');
+}
+
+// --- HTML results-page parsing (the *_web keyless providers) --------------
+//
+// No HTML parser is among this project's dependencies, and a search results
+// page needs only two things lifted out of it — result anchors and their
+// snippets — so the extraction below is deliberately narrow regex work over
+// well-known markup. Anything it cannot recognize (a no-results page, a
+// bot-challenge page, a markup change) yields [], which search() treats
+// exactly like an empty API response: fall through to the next provider.
+
+// Effective User-Agent for a scraped results page: an operator-configured
+// agent always wins; the project's identifying default does not, because
+// these endpoints bot-challenge it.
+function scraperUserAgent(config) {
+  if (config?.scraperUserAgent) return config.scraperUserAgent;
+  if (config?.userAgent && config.userAgent !== DEFAULT_USER_AGENT) return config.userAgent;
+  return DEFAULT_SCRAPER_USER_AGENT;
+}
+
+function htmlHeaders(config) {
+  return {
+    Accept: 'text/html,application/xhtml+xml',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'User-Agent': scraperUserAgent(config)
+  };
+}
+
+// All <a>…</a> elements whose class list contains `className`, in page
+// order, as { href, text } with tags stripped and entities decoded.
+function extractAnchors(html, className) {
+  const anchors = [];
+  const anchorPattern = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = anchorPattern.exec(html)) !== null) {
+    const attrs = match[1];
+    const classMatch = attrs.match(/class\s*=\s*"([^"]*)"|class\s*=\s*'([^']*)'/i);
+    const classes = (classMatch?.[1] || classMatch?.[2] || '').split(/\s+/);
+    if (!classes.includes(className)) continue;
+    const hrefMatch = attrs.match(/href\s*=\s*"([^"]*)"|href\s*=\s*'([^']*)'/i);
+    anchors.push({
+      href: decodeHtmlEntities(hrefMatch?.[1] || hrefMatch?.[2] || ''),
+      text: stripTags(match[2]),
+      index: match.index // page offset, so callers can slice per-result blocks
+    });
+  }
+  return anchors;
+}
+
+// Inner text of every element (any tag) whose class list contains
+// `className`, in page order. DuckDuckGo snippets are <a> on the html
+// endpoint but <td> on the lite one; Bing snippets are <p>.
+function extractClassTexts(html, className) {
+  const texts = [];
+  // Match the snippet element itself (not any ancestor carrying a class),
+  // so wrappers around a result can never swallow its snippet.
+  const elementPattern = new RegExp(
+    `<(\\w+)\\b[^>]*class\\s*=\\s*"[^"]*\\b${className}\\b[^"]*"[^>]*>([\\s\\S]*?)</\\1>`,
+    'gi'
+  );
+  let match;
+  while ((match = elementPattern.exec(html)) !== null) {
+    texts.push(stripTags(match[2]));
+  }
+  return texts;
+}
+
+// DuckDuckGo result links are redirectors:
+// //duckduckgo.com/l/?uddg=<percent-encoded real URL>&rut=… — hand the
+// caller the real destination so citations point at the source, not DDG.
+function resolveDuckDuckGoUrl(href) {
+  let url = String(href || '').trim();
+  if (!url) return '';
+  if (url.startsWith('//')) url = `https:${url}`;
+  try {
+    const parsed = new URL(url, 'https://duckduckgo.com/');
+    const target = parsed.searchParams.get('uddg');
+    if (target) return target;
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// Bing result links are usually direct, but some are /ck/a redirectors
+// carrying the target base64url-encoded in `u` (prefixed "a1"). An
+// undecodable redirector is dropped rather than cited as a bing.com URL.
+function resolveBingUrl(href) {
+  let url = String(href || '').trim();
+  if (!url) return '';
+  if (url.startsWith('//')) url = `https:${url}`;
+  try {
+    const parsed = new URL(url, 'https://www.bing.com/');
+    if (parsed.hostname.endsWith('bing.com') && parsed.pathname.includes('/ck/a')) {
+      const encoded = parsed.searchParams.get('u') || '';
+      if (!encoded.startsWith('a1')) return '';
+      const decoded = Buffer.from(
+        encoded.slice(2).replace(/-/g, '+').replace(/_/g, '/'),
+        'base64'
+      ).toString('utf8');
+      return /^https?:\/\//i.test(decoded) ? decoded : '';
+    }
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : '';
+  } catch (err) {
+    return '';
+  }
 }
 
 // One adapter per provider: build the (provider-specific) request, then map
@@ -307,6 +472,65 @@ const PROVIDER_ADAPTERS = {
         snippet: r.snippet,
         publishedDate: r.date
       }));
+    }
+  },
+  duckduckgo_web: {
+    requiresKey: false,
+    buildRequest(query, maxResults, config) {
+      return {
+        method: 'get',
+        url: config.url,
+        params: { q: query },
+        headers: htmlHeaders(config)
+      };
+    },
+    parse(data) {
+      // The html endpoint answers a results *page*, not JSON. A no-results
+      // or bot-challenge page simply contains no result anchors, so this
+      // returns [] and search() falls through to the next provider.
+      if (typeof data !== 'string') return [];
+      const anchors = extractAnchors(data, 'result__a');
+      return anchors.map((anchor, index) => {
+        // The snippet belonging to a result lives between its title anchor
+        // and the next result's — slicing per result keeps snippets aligned
+        // even when a result has none (a page-wide snippet list would not).
+        const block = data.slice(anchor.index, anchors[index + 1]?.index ?? data.length);
+        return {
+          title: anchor.text,
+          url: resolveDuckDuckGoUrl(anchor.href),
+          snippet: extractClassTexts(block, 'result__snippet')[0] || ''
+        };
+      });
+    }
+  },
+  bing_web: {
+    requiresKey: false,
+    buildRequest(query, maxResults, config) {
+      return {
+        method: 'get',
+        url: config.url,
+        params: { q: query, count: maxResults },
+        headers: htmlHeaders(config)
+      };
+    },
+    parse(data) {
+      if (typeof data !== 'string') return [];
+      // Each organic result is one <li class="b_algo"> block holding an
+      // <h2><a> title link and a caption paragraph. (b_ad / b_ans blocks
+      // are ads and answers, not web results, and are ignored.)
+      const results = [];
+      const blocks = data.split(/<li[^>]*class\s*=\s*"[^"]*\bb_algo\b[^"]*"[^>]*>/i).slice(1);
+      for (const block of blocks) {
+        const heading = block.match(/<h2[^>]*>\s*<a[^>]*href\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
+        if (!heading) continue;
+        const caption = block.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+        results.push({
+          title: stripTags(heading[2]),
+          url: resolveBingUrl(decodeHtmlEntities(heading[1])),
+          snippet: caption ? stripTags(caption[1]) : ''
+        });
+      }
+      return results;
     }
   },
   duckduckgo: {
@@ -495,6 +719,9 @@ function createResearchClient(options = {}) {
       apiKey: apiKey || null,
       url: (typeof config === 'object' && config.url) || DEFAULT_URLS[name],
       userAgent: (typeof config === 'object' && config.userAgent) || userAgent,
+      ...(typeof config === 'object' && config.scraperUserAgent
+        ? { scraperUserAgent: config.scraperUserAgent }
+        : {}),
       ...(typeof config === 'object' && config.mailto ? { mailto: config.mailto } : {})
     };
   }
@@ -572,7 +799,10 @@ function createResearchClient(options = {}) {
           timeout: timeoutMs
         };
         const response = await axios(requestConfig);
-        const results = normalizeResults(adapter.parse(response?.data));
+        // Not every endpoint honors the requested count (a results page
+        // returns as many as it returns), so the cap is enforced here,
+        // once, for every provider.
+        const results = normalizeResults(adapter.parse(response?.data)).slice(0, maxResults);
         if (!results.length) {
           throw new ResearchError('RESEARCH_EMPTY', `Research provider "${name}" returned no usable results.`);
         }

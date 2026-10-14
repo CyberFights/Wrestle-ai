@@ -524,6 +524,19 @@ test('isThinResearchQuery spotlights messages that name no topic', () => {
   }
 });
 
+test('an unrendered template placeholder is not a query', () => {
+  // A client whose own branch never assigned the variable sends the literal
+  // placeholder; searching it returns whatever that text means to a search
+  // engine, so it is treated as carrying no topic.
+  for (const placeholder of ['$var[q]', '$getVar[JaxHuman]', '{{query}}', '{{ query }}', '${topic}']) {
+    assert.equal(isThinResearchQuery(placeholder), true, `${placeholder} is not a topic`);
+  }
+  // Dollar figures and normal text are untouched.
+  for (const real of ['$100 million quake damage', 'earthquakes in Chile', '$5 coffee']) {
+    assert.equal(isThinResearchQuery(real), false, `${real} names a topic`);
+  }
+});
+
 test('buildResearchQuery inherits the topic from the most recent substantive user turn', () => {
   const history = [
     { role: 'user', content: 'were there any earthquakes on the Mid-Atlantic Ridge yesterday?' },

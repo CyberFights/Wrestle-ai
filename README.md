@@ -205,7 +205,12 @@ What happens on a researched request:
    next provider is tried. Use `research_provider: 'wikipedia'` (etc.) to pin one.
    Identical queries are cached in-process for `RESEARCH_CACHE_TTL_MS`.
 
-   **A caller-supplied fragment is not a query.** Clients that build
+   **Two more caller mistakes are absorbed rather than searched.** An
+   **unrendered template placeholder** — a client whose branch never assigned the
+   variable sends `research_query: "$var[q]"`, `"{{query}}"` or `"${topic}"`, and
+   searching that returns whatever the placeholder text means to a search engine —
+   is treated as carrying no topic and ignored. **A caller-supplied fragment is not
+   a query.** Clients that build
    `research_query` from a tokenised message (or a "topic" field) can send one word —
    `research_query: "research"` for "research the two Atlantic ridge earthquakes…",
    which a build searching it verbatim answers with research definitions, academic

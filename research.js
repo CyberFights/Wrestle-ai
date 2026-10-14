@@ -1353,6 +1353,13 @@ const LOOKUP_META_WORDS = new Set([
   'helping', 'try', 'trying'
 ]);
 
+// A client that builds the query by substitution can fail to render it, and the
+// literal placeholder then becomes the search: "$var[q]", "{{query}}", "${topic}".
+// That is a bug in the caller, not a topic — searching it returns whatever the
+// placeholder text happens to mean to a search engine. (A real BDFD-style script
+// sends research_query: "$var[q]" whenever its own if-branch never assigned q.)
+const UNRENDERED_TEMPLATE = /^(?:\$[A-Za-z_]\w*(?:\[[^\[\]]*\])+|\{\{[\w\s.$-]*\}\}|\$\{[\w\s.$-]*\})$/;
+
 // Low-value words that should not by themselves make a query look topical.
 const RELEVANCE_STOPWORDS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this', 'these', 'those', 'from', 'into', 'about',
@@ -1427,6 +1434,7 @@ function isThinResearchQuery(text) {
   if (!value) return true;
   if (value.length < MIN_RESEARCH_QUERY_CHARS) return true;
   if (AFFIRMATION_ONLY.test(value)) return true;
+  if (UNRENDERED_TEMPLATE.test(value)) return true;
   // Comma-joined affirmations ("sure, go ahead", "ok then, thanks") are still
   // one acknowledgement, not a topic.
   const parts = value.split(/[,;.!?…]+/).map(part => part.trim()).filter(Boolean);

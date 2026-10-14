@@ -1208,6 +1208,20 @@ if (require.main === module) {
       const port = process.env.PORT || 8080;
       const server = app.listen(port, '0.0.0.0', () => {
         console.log(`Wrestling bot API running on port ${port}`);
+        // One line that answers "is this deployment running the research
+        // grounding fixes?" from the logs alone — three separate incidents
+        // were diagnosed against a service that turned out not to be running
+        // the merged code. Provider NAMES only; never a key.
+        console.log([
+          'Research guards:',
+          `enabled=${researchClient.enabled}`,
+          `providers=[${researchClient.configuredProviders.join(',') || 'none'}]`,
+          `autoTrigger=${RESEARCH_AUTO_TRIGGER}`,
+          `noDataGuard=${RESEARCH_NO_DATA_GUARD}`,
+          'dateStamp=on',
+          'failureNotice=on',
+          'citationAudit=on'
+        ].join(' '));
       });
       server.keepAliveTimeout = 61000;
       server.headersTimeout = 62000;

@@ -929,7 +929,13 @@ const NO_SOURCE_RULES = [
   'Never say or imply that you searched, checked, combed, monitored or consulted any database, feed, archive, agency or website.',
   'Do not state that a recent event did or did not happen, or give its magnitude, date, time or location from memory — and do not report a negative result ("nothing in the last 24 hours", "no 6.0+ events", "the largest was …") as if it were verified.',
   'Never offer to monitor, watch, track, alert or notify about future events: you cannot do that between conversations, and promising it misrepresents your capability.',
-  'Anything you recall from training may be years out of date: mark it plainly as unverified recollection that may be stale, or leave it out.'
+  'Anything you recall from training may be years out of date: mark it plainly as unverified recollection that may be stale, or leave it out.',
+  // Conversations are replayed back to the model as history, so an unverified
+  // claim it made earlier comes back as apparent context. Left unchecked, each
+  // reply launders the last one: an invented "5.8 near the Azores" resurfaces a
+  // few turns later as the "biggest of the last 30 days", citation number
+  // attached, with no source anywhere behind it.
+  'Earlier turns in this conversation are not a source either: if an earlier reply of yours asserted current facts, magnitudes, dates or citations, do not repeat or build on them — they were not verified against anything available to you now, and repeating them is what turns one unchecked claim into an established-looking fact.'
 ];
 
 /*
@@ -1027,8 +1033,17 @@ function auditCitations(text, sourceCount) {
  *   - a lookup verb ("research", "look up", "search", "fact-check", "verify")
  *     is an explicit ask, so it triggers on its own;
  *   - otherwise, a time-sensitive marker ("latest", "yesterday", "news",
- *     "so far", a year) triggers only when the message is actually asking a
- *     question, so "the news was on at the gym" is not a lookup.
+ *     "so far", a year) triggers only when the message reads as a request —
+ *     a question, or an imperative ask for a listing. "the news was on at the
+ *     gym" is not a lookup; "list all ridge earthquakes in the last 30 days"
+ *     is one, and it never says "search".
+ *
+ * The occasional over-trigger is acceptable by design: both notices scope
+ * themselves to real-world factual claims and explicitly leave in-character
+ * conversation, opinions and roleplay unrestricted, so a chat message that
+ * trips the heuristic keeps its persona and pays only for the extra sentence.
+ * Missing a real lookup ask is the expensive direction — that is the turn that
+ * gets answered from memory.
  */
 const RESEARCH_LOOKUP_VERBS = /\b(?:research|look\s?up|search(?:\s+(?:for|up))?|google|fact[\s-]?check|double[\s-]?check|verify|cross[\s-]?reference|cite|sources?)\b/i;
 // "last 24 hours" and "past 30 days" are the phrasings these questions
@@ -1036,12 +1051,16 @@ const RESEARCH_LOOKUP_VERBS = /\b(?:research|look\s?up|search(?:\s+(?:for|up))?|
 // a unit) is a marker in its own right.
 const RESEARCH_TIME_MARKERS = /\b(?:latest|newest|most recent|recent(?:ly)?|current(?:ly)?|right now|today|tonight|yesterday|tomorrow|this (?:week|month|year|morning|afternoon|evening)|last (?:night|week|month|year)|(?:last|past|next) \d+ (?:minutes?|hours?|days?|weeks?|months?|years?|decades?)|next (?:week|month|year)|breaking|news|headline[sd]?|update[sd]?|as of|so far|real[\s-]?time|up[\s-]?to[\s-]?date|just (?:happened|now|in)|20\d\d)\b/i;
 const RESEARCH_QUESTION_FORM = /\?|\b(?:what|when|where|which|who|whom|whose|why|how(?:\s+(?:many|much|long|often|big|strong))?|is there|are there|was there|were there|any|did|does|do|has|have)\b/i;
+// Imperative asks are requests too — "list all ridge quakes in the last 30
+// days" is a lookup request that contains none of the lookup verbs.
+const RESEARCH_REQUEST_VERBS = /\b(?:list|give me|show me|tell me|find|fetch|pull up|get me|summari[sz]e|recap|round ?up|compare|chart|plot|breakdown|break down)\b/i;
 
 function detectResearchIntent(text) {
   const value = typeof text === 'string' ? text.trim() : '';
   if (!value) return false;
   if (RESEARCH_LOOKUP_VERBS.test(value)) return true;
-  return RESEARCH_TIME_MARKERS.test(value) && RESEARCH_QUESTION_FORM.test(value);
+  if (!RESEARCH_TIME_MARKERS.test(value)) return false;
+  return RESEARCH_QUESTION_FORM.test(value) || RESEARCH_REQUEST_VERBS.test(value);
 }
 
 module.exports = {

@@ -57,7 +57,13 @@ Optional:
   the alternative is a chat model improvising exactly that answer with no failure
   anywhere for the caller to notice. Ordinary conversation is not affected (the same
   conservative detector as `RESEARCH_AUTO_TRIGGER` decides), and the notice explicitly
-  leaves in-character conversation, opinions and roleplay unrestricted.
+  leaves in-character conversation, opinions and roleplay unrestricted. It also forbids
+  the compounding failure that conversations create on their own: earlier turns are
+  replayed back to the model as history, so an unverified claim it made a few turns ago
+  returns as apparent context and gets restated as established fact — an invented "5.8
+  near the Azores" reappearing as "the biggest of the last 30 days", citation number
+  attached. Both notices therefore state that earlier turns of the conversation are not
+  a source either.
 - `RESEARCH_KEYLESS_ENABLED` — enable the free, no-API-key providers (default `true`):
   general web search via the public DuckDuckGo / Bing results pages
   (`DUCKDUCKGO_WEB_API_URL` / `BING_WEB_API_URL`), then DuckDuckGo Instant Answers
@@ -90,6 +96,12 @@ Optional:
   (default `800`; ordinary chat keeps the usual `250`).
 - `RESEARCH_CACHE_TTL_MS` — how long identical research queries are served from an
   in-process cache (default `300000`; `0` disables caching).
+
+On startup the server logs one line describing the research guards that are active —
+`Research guards: enabled=… providers=[…] autoTrigger=… noDataGuard=… dateStamp=on
+failureNotice=on citationAudit=on`. It carries provider *names*, never keys, and exists
+so that "is this deployment running the research grounding fixes?" is answerable from
+the logs instead of from a failing answer.
 - `ANALYSIS_ENABLED` — master switch for Tier 2 data analysis on `POST /wrestling_chat`
   (default `true`). Analysis only runs when a request sends `analysis: true`.
 - `WORLDBANK_API_URL` / `RESTCOUNTRIES_API_URL` — endpoint overrides for the two keyless

@@ -460,3 +460,22 @@ test('detectResearchIntent understands counted windows like "last 24 hours"', ()
   // Bare "live" used to be a marker; "where do you live?" is ordinary chat.
   assert.equal(detectResearchIntent('where do you live?'), false);
 });
+
+test('both no-source notices forbid recycling earlier turns of the conversation', () => {
+  // The compounding failure: an unverified claim made earlier is replayed back
+  // as history and restated later as established fact ("the biggest of the last
+  // 30 days"), with citations attached and no source behind it.
+  const historyRule = /Earlier turns in this conversation are not a source/;
+  assert.match(formatNoLiveDataNotice(new Date('2026-10-14T15:00:00Z')), historyRule);
+  assert.match(formatResearchFailureNotice('boom', new Date('2026-10-14T15:00:00Z')), historyRule);
+});
+
+test('detectResearchIntent treats imperative listings as requests, not just questions', () => {
+  // The real request that exposed this: a listing, with no "search" verb and
+  // no question mark.
+  assert.equal(detectResearchIntent('list all Mid-Atlantic Ridge earthquakes in the last 30 days'), true);
+  assert.equal(detectResearchIntent('give me a breakdown of Atlantic quakes this month'), true);
+  // Still not a lookup: a request with no time-sensitive window.
+  assert.equal(detectResearchIntent('list what you remember about our match'), false);
+  assert.equal(detectResearchIntent('tell me a joke'), false);
+});

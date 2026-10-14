@@ -1305,6 +1305,52 @@ function sanitizeFabricatedCitations(text, sourceCount) {
   };
 }
 
+/*
+ * A lookup query has to name a topic.
+ *
+ * Both channels that can feed a provider — `research_query` and the request's
+ * own message — can carry a bare follow-up. A user who types "ok" after asking
+ * about the Mid-Atlantic Ridge has not changed the subject, but "ok" is what
+ * used to go to the provider: the chain searched the history of the word,
+ * returned Wikipedia / Katy Perry / celebrity-gossip pages, and the model
+ * correctly reported that none of them contained seismic data. An irrelevant
+ * lookup is worse than no lookup, because it fills the context with confident
+ * material about the wrong subject.
+ *
+ * So a thin message inherits its topic from the most recent substantive user
+ * turn. When there is nothing to inherit, the caller gets an empty query and
+ * the turn is answered without a lookup at all.
+ */
+const AFFIRMATION_ONLY = /^(?:ok(?:ay)?|k|kk|sure|yes|yeah|yep|yup|ya|no|nope|nah|right|got it|gotcha|thanks|thank you|thx|ty|please|pls|go ahead|go on|go for it|do it|do that|sure thing|sure do|yes please|yes go|yes do(?: it)?|ok go|okay go|ok do(?: it)?|okay do(?: it)?|ok then|okay then|ok so|okay so|fine|cool|nice|great|interesting|wow|lol|haha|hmm+|hm+|uh huh|and|also|then|next|more|continue|carry on|what else|anything else|really|seriously|tell me more|more please|dig deeper|keep going|expand|elaborate|explain|so|well|alright|all right|no way|yikes|ouch)[\s.,!?…]*$/i;
+const MIN_RESEARCH_QUERY_CHARS = 8;
+
+function isThinResearchQuery(text) {
+  const value = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  if (!value) return true;
+  if (value.length < MIN_RESEARCH_QUERY_CHARS) return true;
+  if (AFFIRMATION_ONLY.test(value)) return true;
+  // Comma-joined affirmations ("sure, go ahead", "ok then, thanks") are still
+  // one acknowledgement, not a topic.
+  const parts = value.split(/[,;.!?…]+/).map(part => part.trim()).filter(Boolean);
+  return parts.length > 1 && parts.every(part => AFFIRMATION_ONLY.test(part));
+}
+
+function buildResearchQuery(latestMessage, history) {
+  const latest = String(latestMessage == null ? '' : latestMessage).replace(/\s+/g, ' ').trim();
+  if (!isThinResearchQuery(latest)) return { query: latest, inherited: false };
+
+  const turns = Array.isArray(history) ? history : [];
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const turn = turns[i];
+    if (!turn || turn.role !== 'user') continue;
+    const content = String(turn.content == null ? '' : turn.content).replace(/\s+/g, ' ').trim();
+    if (!content || content === latest) continue; // the message just stored
+    if (isThinResearchQuery(content)) continue;
+    return { query: content, inherited: true };
+  }
+  return { query: '', inherited: false };
+}
+
 module.exports = {
   createResearchClient,
   formatResearchContext,
@@ -1314,6 +1360,8 @@ module.exports = {
   sanitizeFabricatedCitations,
   stripCitationMarkers,
   detectResearchIntent,
+  buildResearchQuery,
+  isThinResearchQuery,
   utcDateStamp,
   describeResearchError,
   ResearchError,

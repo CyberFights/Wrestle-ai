@@ -21,6 +21,8 @@ const {
   auditCitations,
   sanitizeFabricatedCitations,
   stripCitationMarkers,
+  buildResearchQuery,
+  isThinResearchQuery,
   detectResearchIntent,
   utcDateStamp,
   describeResearchError,
@@ -509,4 +511,40 @@ test('stripCitationMarkers clears the replayed-history copy without touching pro
   );
   assert.equal(stripCitationMarkers('plain text'), 'plain text');
   assert.equal(stripCitationMarkers(undefined), '');
+});
+
+test('isThinResearchQuery spotlights messages that name no topic', () => {
+  for (const thin of ['ok', 'OK', 'ok.', 'sure', 'yes please', 'sure, go ahead', 'ok then, thanks', 'hmm', 'more', 'tell me more', 'dig deeper', 'and', 'why?', '', '   ']) {
+    assert.equal(isThinResearchQuery(thin), true, `${JSON.stringify(thin)} carries no topic`);
+  }
+  for (const substantive of ['earthquakes', 'and the volcanoes?', 'lithium iron phosphate pack prices 2026', 'what is the capital of France']) {
+    assert.equal(isThinResearchQuery(substantive), false, `${JSON.stringify(substantive)} names a topic`);
+  }
+});
+
+test('buildResearchQuery inherits the topic from the most recent substantive user turn', () => {
+  const history = [
+    { role: 'user', content: 'were there any earthquakes on the Mid-Atlantic Ridge yesterday?' },
+    { role: 'assistant', content: 'Let me check.' },
+    { role: 'user', content: 'ok' } // the message just stored
+  ];
+
+  // The failure that prompted this: "ok" is never the query.
+  assert.deepEqual(
+    buildResearchQuery('ok', history),
+    { query: 'were there any earthquakes on the Mid-Atlantic Ridge yesterday?', inherited: true }
+  );
+
+  // A substantive message is used as-is; assistant turns are never inherited.
+  assert.deepEqual(
+    buildResearchQuery('research the ridge doublet', history),
+    { query: 'research the ridge doublet', inherited: false }
+  );
+  assert.deepEqual(
+    buildResearchQuery('ok', [{ role: 'assistant', content: 'a long assistant reply about the ridge' }]),
+    { query: '', inherited: false }
+  );
+  // Nothing to inherit anywhere: an empty query, so no lookup runs.
+  assert.deepEqual(buildResearchQuery('ok', []), { query: '', inherited: false });
+  assert.deepEqual(buildResearchQuery('ok', undefined), { query: '', inherited: false });
 });

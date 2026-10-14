@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
-const { createResearchClient, formatResearchContext, formatResearchFailureNotice, formatNoLiveDataNotice, auditCitations, detectResearchIntent, describeResearchError } = require('./research');
+const { createResearchClient, formatResearchContext, formatResearchFailureNotice, formatNoLiveDataNotice, auditCitations, sanitizeFabricatedCitations, stripCitationMarkers, detectResearchIntent, describeResearchError } = require('./research');
 const {
   createDataClient,
   analyzeDataset,
@@ -1013,9 +1013,7 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
       console.warn(`Research failed for /wrestling_chat request: ${details}`);
     }
   }
-  if (researchSystemMessage) {
-    messages.push({ role: 'system', content: researchSystemMessage });
-  }
+  // (The research message is pushed AFTER the chat history — see below.)
 
   // The gap the failure notice does not cover, and the commonest path of all:
   // no lookup was requested, so nothing ran and nothing came back. A message
@@ -1029,7 +1027,6 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
   let noLiveDataNotice = '';
   if (!researchRequested && RESEARCH_NO_DATA_GUARD && detectResearchIntent(userMessage)) {
     noLiveDataNotice = formatNoLiveDataNotice();
-    messages.push({ role: 'system', content: noLiveDataNotice });
   }
 
   // Opt-in data analysis (Tier 2) and predictive modeling (Tier 3) share
@@ -1139,7 +1136,28 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
   if (forecastContext) {
     messages.push({ role: 'system', content: forecastContext });
   }
-  chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
+
+  // Replayed assistant turns get their citation markers stripped from the
+  // prompt copy (stored history is untouched). Those markers were never backed
+  // by anything — the model cannot cite sources it was not given — and leaving
+  // them in the context is precisely what let an invented "[1]" be copied
+  // forward as though it pointed somewhere. The claims themselves stay in
+  // history; only the false attribution goes.
+  chatHistory.forEach(msg => {
+    const content = msg.role === 'assistant' ? stripCitationMarkers(msg.content) : msg.content;
+    messages.push({ role: msg.role, content });
+  });
+
+  // The research message goes last, immediately before generation, rather than
+  // buried above a 10-turn history. It is the constraint that matters most on
+  // a lookup-shaped turn, and instructions that sit furthest from the point of
+  // generation carry the least weight.
+  if (researchSystemMessage) {
+    messages.push({ role: 'system', content: researchSystemMessage });
+  }
+  if (noLiveDataNotice) {
+    messages.push({ role: 'system', content: noLiveDataNotice });
+  }
 
   try {
     // Enhanced (research/analysis/forecast) replies need more room than the
@@ -1152,18 +1170,33 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
     const rawReply = (researchSystemMessage || noLiveDataNotice || analysisContext || forecastContext)
       ? await mistral.chat(messages, { max_tokens: RESEARCH_MAX_TOKENS })
       : await mistral.chat(messages);
-    const botReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
+
+    // Enforcement, not just audit: on a lookup-shaped turn, markers the model
+    // cannot justify are removed from the reply before it is returned or
+    // stored. Four consecutive answers cited sources that were never supplied
+    // — advice had stopped being a control, so this is the deterministic one.
+    // Storing the sanitized text is what stops the loop: the next turn is not
+    // handed back its own fabricated markers as history.
+    const citationSources = (researchMeta && researchMeta.sources || []).length;
+    const guardedCitations = sanitizeFabricatedCitations(rawReply, citationSources);
+    const guardedReply = (researchRequested || noLiveDataNotice) ? guardedCitations.text : rawReply;
+
+    const botReply = humanizeReply ? humanizeResponse(guardedReply) : guardedReply;
     await storeMessage(userId, botReply, 'assistant', CHAT_SCOPE);
 
     // Compare the citation markers the model wrote against the sources it was
-    // actually given. Purely diagnostic — the reply is returned unedited —
-    // but it makes an unauditable claim auditable: on a failed lookup the
-    // source count is 0, so any [1]/[2] the model emitted is reported as an
-    // invalid citation instead of shipping as if it pointed at something.
+    // actually given. Diagnostic — the reply itself was already sanitized
+    // above — but it makes an unauditable claim auditable: on a failed lookup
+    // the source count is 0, so any [1]/[2] the model emitted is reported as
+    // an invalid citation instead of shipping as if it pointed at something.
+    // `stripped` lists what the sanitizer actually removed from the reply.
     if (researchRequested) {
       researchMeta = {
         ...researchMeta,
-        citations: auditCitations(rawReply, (researchMeta && researchMeta.sources || []).length)
+        citations: {
+          ...auditCitations(rawReply, (researchMeta && researchMeta.sources || []).length),
+          stripped: guardedCitations.removed
+        }
       };
     }
 

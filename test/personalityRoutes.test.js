@@ -357,6 +357,25 @@ test('GET /personality_profile 404s when nobody is stored', async () => {
   assert.equal(res.status, 404);
 });
 
+test('GET /personality serves the upload page', async () => {
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: '127.0.0.1', port: PORT, path: '/personality', method: 'GET' },
+      incoming => {
+        let raw = '';
+        incoming.on('data', chunk => { raw += chunk; });
+        incoming.on('end', () => resolve({ status: incoming.statusCode, body: raw, type: incoming.headers['content-type'] }));
+      }
+    );
+    req.on('error', reject);
+    req.end();
+  });
+  assert.equal(res.status, 200);
+  assert.match(res.type || '', /html/i);
+  assert.match(res.body, /personality_profile/);
+  assert.match(res.body, /Drop the full document/);
+});
+
 test('POST /personality_profile rejects consent: false and notes privacy otherwise', async () => {
   const denied = await request('POST', '/personality_profile', {
     user_id: 'u-consent',

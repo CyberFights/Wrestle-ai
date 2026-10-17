@@ -11,8 +11,24 @@ const {
   getLastMessages,
   getCharacterFacts,
   updateCharacterFacts,
+  savePersonProfile,
+  getPersonProfile,
+  listPersonProfiles,
   MODEL_HISTORY_LIMIT
 } = require('./memoryStore');
+const { DocumentExtractError } = require('./documentExtract');
+const {
+  collectBodyDocuments,
+  filesFromUploads,
+  analyzePersonDocuments
+} = require('./personalityProfile');
+
+let multer = null;
+try {
+  multer = require('multer');
+} catch (err) {
+  multer = null;
+}
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
@@ -799,6 +815,156 @@ and momentum shifts.`;
       error: 'Mistral API error',
       details
     });
+  }
+});
+
+function acceptProfileUploads(req, res, next) {
+  const contentType = String(req.headers['content-type'] || '');
+  if (!contentType.includes('multipart/form-data')) return next();
+  if (!multer) {
+    return res.status(400).json({
+      error: 'Multipart uploads are unavailable (multer is not installed). Send JSON with a document/text field instead.',
+      request_id: req.requestId
+    });
+  }
+  const maxBytes = parsePositiveInt(process.env.PROFILE_UPLOAD_MAX_BYTES, 8 * 1024 * 1024);
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: maxBytes, files: 12 }
+  }).any();
+  upload(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: 'Uploaded file too large.',
+        details: `Each file must be at most ${maxBytes} bytes.`,
+        request_id: req.requestId
+      });
+    }
+    return res.status(400).json({
+      error: 'Upload failed.',
+      details: err.message,
+      request_id: req.requestId
+    });
+  });
+}
+
+app.post('/personality_profile', acceptProfileUploads, async (req, res) => {
+  const body = req.body || {};
+  const userId = asString(body.user_id).trim();
+  const personName = asString(body.person_name || body.name || body.person || body.subject).trim();
+  const replace = parseOptionalBoolean(body.replace, false);
+
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing user_id.' });
+  }
+
+  try {
+    const uploaded = Array.isArray(req.files) ? req.files : [];
+    const fromFiles = await filesFromUploads(uploaded);
+    const fromBody = collectBodyDocuments(body);
+    const documents = [...fromFiles, ...fromBody];
+    if (!documents.length) {
+      return res.status(400).json({
+        error: 'Missing document.',
+        details: 'Upload a file (multipart field files/file/document) or send document/text/journal in the JSON body.'
+      });
+    }
+
+    let priorProfile = null;
+    if (personName && !replace) {
+      const existing = await getPersonProfile(userId, personName);
+      if (existing && existing.profile) priorProfile = existing.profile;
+    }
+
+    const result = await analyzePersonDocuments({
+      mistral,
+      personName,
+      documents,
+      priorProfile
+    });
+
+    const savedName = asString(result.profile.person_name || personName).trim();
+    if (!savedName) {
+      return res.status(400).json({
+        error: 'Could not determine the person\'s name.',
+        details: 'Send person_name, or use a document that clearly names the subject.'
+      });
+    }
+    result.profile.person_name = savedName;
+
+    const saved = await savePersonProfile(userId, savedName, result);
+    return res.json({
+      person_name: saved.person_name,
+      person_key: saved.person_key,
+      profile: result.profile,
+      system_prompt: result.system_prompt,
+      sources: result.sources,
+      meta: {
+        memory_folder: 'profiles',
+        created_at: saved.created_at,
+        updated_at: saved.updated_at,
+        merged: Boolean(priorProfile),
+        truncated: Boolean(result.truncated)
+      }
+    });
+  } catch (error) {
+    if (error instanceof DocumentExtractError) {
+      const status = error.code === 'UNSUPPORTED_TYPE' ? 415 : 400;
+      return res.status(status).json({
+        error: error.message,
+        code: error.code,
+        request_id: req.requestId
+      });
+    }
+    const details = describeMistralError(error);
+    console.error(`Personality profile request failed: ${details}`);
+    return res.status(500).json({
+      error: 'Personality profile failed.',
+      details,
+      request_id: req.requestId
+    });
+  }
+});
+
+app.get('/personality_profile', async (req, res) => {
+  const userId = asString(req.query.user_id).trim();
+  const personName = asString(req.query.person_name || req.query.name || req.query.person).trim();
+  if (!userId || !personName) {
+    return res.status(400).json({ error: 'Missing user_id or person_name.' });
+  }
+  try {
+    const saved = await getPersonProfile(userId, personName);
+    if (!saved) {
+      return res.status(404).json({ error: 'No profile saved for that person.' });
+    }
+    return res.json({
+      person_name: saved.person_name,
+      person_key: saved.person_key,
+      profile: saved.profile,
+      system_prompt: saved.system_prompt,
+      sources: saved.sources || [],
+      meta: {
+        memory_folder: 'profiles',
+        created_at: saved.created_at,
+        updated_at: saved.updated_at
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+});
+
+app.get('/personality_profiles', async (req, res) => {
+  const userId = asString(req.query.user_id).trim();
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing user_id.' });
+  }
+  try {
+    const profiles = await listPersonProfiles(userId);
+    return res.json({ profiles });
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
   }
 });
 

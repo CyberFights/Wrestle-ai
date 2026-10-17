@@ -52,9 +52,12 @@ const { MongoClient } = require('mongodb');
 const {
   chatFolderNameForUser,
   factsFolderNameForUser,
+  profilesFolderNameForUser,
+  personKeyForName,
   isUserFolderName,
   isChatFolderName,
   isFactsFolderName,
+  isProfilesFolderName,
   BATTLE_SCOPE
 } = require('./memoryFolders');
 
@@ -147,6 +150,10 @@ function ensureChatFolder(userId, scope) {
 // The user's character facts folder for an endpoint scope:  <base>_facts[_battle]
 function ensureFactsFolder(userId, scope) {
   return ensureFolder(factsFolderNameForUser(userId, scope));
+}
+
+function ensureProfilesFolder(userId) {
+  return ensureFolder(profilesFolderNameForUser(userId));
 }
 
 async function initDb() {
@@ -245,7 +252,12 @@ async function migrateLegacyMemory() {
     const { name } = await folderCursor.next();
     // Only the old untyped single folders are split; typed folders already
     // carry a scope and must not be re-migrated into the battle scope.
-    if (isUserFolderName(name) && !isChatFolderName(name) && !isFactsFolderName(name)) {
+    if (
+      isUserFolderName(name) &&
+      !isChatFolderName(name) &&
+      !isFactsFolderName(name) &&
+      !isProfilesFolderName(name)
+    ) {
       sources.push(name);
     }
   }
@@ -401,6 +413,68 @@ async function updateCharacterFacts(userId, facts, scope) {
   await folder.updateOne({ _id: id }, update, { upsert: true });
 }
 
+// ---------- PERSON PROFILES (the user's profiles folder) ----------
+// One document per person name, stored under <base>_profiles. Isolated from
+// chat/battle/ugcw memory so a profile never leaks into those personas.
+
+async function savePersonProfile(userId, personName, record) {
+  const id = String(userId);
+  const name = String(personName || '').trim();
+  if (!name) throw new Error('savePersonProfile: personName is required');
+  const key = personKeyForName(name);
+  const now = new Date();
+  const folder = await ensureProfilesFolder(id);
+  const existing = await folder.findOne({ _id: key }, { projection: { created_at: 1 } });
+  const doc = {
+    _id: key,
+    user_id: id,
+    person_key: key,
+    person_name: name,
+    profile: record && record.profile ? record.profile : {},
+    system_prompt: record && record.system_prompt != null ? String(record.system_prompt) : '',
+    sources: Array.isArray(record && record.sources) ? record.sources : [],
+    updated_at: now
+  };
+  if (existing && existing.created_at) {
+    doc.created_at = existing.created_at;
+    await folder.replaceOne({ _id: key }, doc);
+  } else {
+    doc.created_at = now;
+    await folder.updateOne({ _id: key }, { $set: doc }, { upsert: true });
+  }
+  return doc;
+}
+
+async function getPersonProfile(userId, personName) {
+  const id = String(userId);
+  const name = String(personName || '').trim();
+  if (!name) return null;
+  const folder = await ensureProfilesFolder(id);
+  const key = personKeyForName(name);
+  const byKey = await folder.findOne({ _id: key });
+  if (byKey) return byKey;
+  return folder.findOne({ user_id: id, person_name: name });
+}
+
+async function listPersonProfiles(userId) {
+  const id = String(userId);
+  const folder = await ensureProfilesFolder(id);
+  const rows = await folder
+    .find(
+      { user_id: id },
+      { projection: { person_name: 1, person_key: 1, updated_at: 1, created_at: 1, 'profile.summary': 1 } }
+    )
+    .sort({ updated_at: -1 })
+    .toArray();
+  return rows.map(row => ({
+    person_name: row.person_name,
+    person_key: row.person_key || row._id,
+    summary: row.profile && row.profile.summary ? row.profile.summary : '',
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  }));
+}
+
 module.exports = {
   initDb,
   closeDb,
@@ -408,8 +482,12 @@ module.exports = {
   getLastMessages,
   getCharacterFacts,
   updateCharacterFacts,
+  savePersonProfile,
+  getPersonProfile,
+  listPersonProfiles,
   ensureChatFolder,
   ensureFactsFolder,
+  ensureProfilesFolder,
   migrateLegacyMemory,
   listUserFolders,
   parseFactEntries,

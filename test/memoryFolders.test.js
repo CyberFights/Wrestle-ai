@@ -16,11 +16,15 @@ const {
   collectionNameForUser,
   chatFolderNameForUser,
   factsFolderNameForUser,
+  profilesFolderNameForUser,
+  personKeyForName,
   isUserFolderName,
   isChatFolderName,
   isFactsFolderName,
+  isProfilesFolderName,
   CHAT_FOLDER_SUFFIX,
   FACTS_FOLDER_SUFFIX,
+  PROFILES_FOLDER_SUFFIX,
   CHAT_SCOPE,
   BATTLE_SCOPE,
   UGCW_SCOPE,
@@ -134,6 +138,18 @@ test('scoped folders never collide across users or endpoints', () => {
       }
     }
   }
+});
+
+test('profiles live in their own folder under the person\'s name key', () => {
+  assert.equal(profilesFolderNameForUser('12345'), 'memory_r_12345_profiles');
+  assert.equal(profilesFolderNameForUser('12345'), collectionNameForUser('12345') + PROFILES_FOLDER_SUFFIX);
+  assert.ok(isProfilesFolderName('memory_r_ann_profiles'));
+  assert.equal(isChatFolderName('memory_r_ann_profiles'), false);
+  assert.equal(isFactsFolderName('memory_r_ann_profiles'), false);
+  assert.ok(Buffer.byteLength(profilesFolderNameForUser('a'.repeat(60)), 'utf8') <= MONGO_NAME_LIMIT);
+  assert.equal(personKeyForName('Jane Doe'), 'jane_doe');
+  assert.equal(personKeyForName('  Jane   DOE '), 'jane_doe');
+  assert.notEqual(personKeyForName('alice'), personKeyForName('bob'));
 });
 
 test('name predicates classify the battle-scoped folders', () => {

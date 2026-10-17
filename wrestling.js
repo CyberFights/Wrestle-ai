@@ -4,18 +4,6 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
-const { createResearchClient, formatResearchContext, formatResearchFailureNotice, formatNoLiveDataNotice, auditCitations, sanitizeFabricatedCitations, stripCitationMarkers, detectResearchIntent, buildResearchQuery, describeResearchError, ResearchError } = require('./research');
-const {
-  createDataClient,
-  analyzeDataset,
-  formatAnalysisContext,
-  describeDataError
-} = require('./dataAnalysis');
-const {
-  createForecaster,
-  formatForecastContext,
-  formatForecastRefusalContext
-} = require('./forecasting');
 const { CHAT_SCOPE, BATTLE_SCOPE, UGCW_SCOPE } = require('./memoryFolders');
 const {
   initDb,
@@ -34,37 +22,6 @@ if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
 // error descriptions. IMPORTANT: never log a raw axios error object — it
 // contains config.headers.Authorization, i.e. the API key.
 const mistral = createMistralClient({ apiKey: MISTRAL_API_KEY });
-
-// Opt-in web research for /wrestling_chat (see research.js). Inert until a
-// request explicitly asks for it: creating the client never calls the
-// network, and ordinary chats never touch it. Keyless providers
-// (DuckDuckGo / Wikipedia / OpenAlex) make it work with no API key at all.
-const researchClient = createResearchClient();
-const RESEARCH_MAX_TOKENS = parsePositiveInt(process.env.RESEARCH_MAX_TOKENS, 800);
-// Optional heuristic triggering. The endpoint's contract is strict opt-in:
-// only the request's `research` field starts a lookup. But "research the two
-// Atlantic ridge earthquakes" typed into a chat box is an explicit request to
-// a human reader and an ordinary string to the API, so with this on, a message
-// that asks for a lookup (or asks a plainly time-sensitive question) turns
-// research on by itself. Off by default — no deployment gets surprise network
-// calls or surprise provider costs unless it asks for them.
-const RESEARCH_AUTO_TRIGGER = parseOptionalBoolean(process.env.RESEARCH_AUTO_TRIGGER, false);
-// The no-lookup counterpart, on by default because it costs nothing: when a
-// message reads like a request for current information and no lookup ran, the
-// model is told it has no retrieved material — instead of being left to
-// improvise a research-shaped answer from memory. See formatNoLiveDataNotice.
-const RESEARCH_NO_DATA_GUARD = parseOptionalBoolean(process.env.RESEARCH_NO_DATA_GUARD, true);
-
-// Opt-in Tier 2 data analysis for /wrestling_chat (see dataAnalysis.js):
-// structured datasets (World Bank / REST Countries / caller-supplied rows)
-// analyzed locally and deterministically. Equally inert until requested —
-// creating the client never calls the network.
-const dataClient = createDataClient();
-
-// Opt-in Tier 3 predictive modeling for /wrestling_chat (see forecasting.js):
-// local, deterministic forecasting over a Tier 2 dataset's series. Inert
-// until requested; creating it never calls the network (it has no I/O).
-const forecaster = createForecaster();
 
 const app = express();
 
@@ -471,55 +428,6 @@ function memoryForModel(characterFacts) {
   );
 }
 
-// Tier 2 dataset spec resolution. Three caller shapes, most explicit first:
-//   dataset: { provider: 'worldbank', country: 'CAN', indicator: '…' }  (or
-//            { provider: 'restcountries', code: 'CAN' }, or { rows: [...] },
-//            or a JSON string of any of those)
-//   data:    [...] / { rows: [...] } / JSON-or-CSV string  (inline rows)
-//   flat:    data_provider + country/indicator/… fields
-// Returns null when the request carries no dataset at all.
-function buildDatasetSpec(body) {
-  if (Array.isArray(body.dataset)) return { provider: 'inline', rows: body.dataset };
-  const dataset = parseObject(body.dataset);
-  if (Object.keys(dataset).length) return dataset;
-  if (body.data != null) return { provider: 'inline', data: body.data };
-
-  const flat = {};
-  const fields = ['country', 'countries', 'indicator', 'start_year', 'end_year', 'region', 'code', 'codes', 'name'];
-  if (body.data_provider != null) flat.provider = body.data_provider;
-  for (const field of fields) {
-    if (body[field] != null) flat[field] = body[field];
-  }
-  return Object.keys(flat).length ? flat : null;
-}
-
-// Explicit request fields (analysis_x / analysis_y / analysis_group_by or
-// x/y/groupBy inside the dataset object) win over provider defaults such as
-// World Bank's year/value.
-function analysisOptionsFor(body, defaults = {}) {
-  const dataset = parseObject(body.dataset);
-  return {
-    x: asString(body.analysis_x).trim() || dataset.x || defaults.x,
-    y: body.analysis_y ?? dataset.y ?? defaults.y,
-    groupBy: asString(body.analysis_group_by).trim() || dataset.groupBy || dataset.group_by || defaults.groupBy
-  };
-}
-
-// Tier 3 forecast options. x/y come from the Tier 2 analysis selection so
-// the forecast always models exactly the series that was analyzed; the
-// forecast_* request fields (prediction_* accepted as aliases) tune the rest.
-function forecastOptionsFor(body, selection = {}) {
-  return {
-    x: selection.x,
-    y: Array.isArray(selection.y) ? selection.y[0] : selection.y,
-    horizon: parseNumber(body.forecast_horizon ?? body.prediction_horizon, undefined),
-    at: parseNumber(body.forecast_at ?? body.prediction_at, undefined),
-    method: asString(body.forecast_method || body.prediction_method).trim().toLowerCase() || undefined,
-    threshold: parseNumber(body.forecast_threshold ?? body.prediction_threshold, undefined),
-    simulations: parseNumber(body.forecast_simulations, undefined)
-  };
-}
-
 // ---------- ROUTES ----------
 
 app.get('/', (req, res) => {
@@ -899,38 +807,12 @@ app.post('/wrestling_chat', async (req, res) => {
     user_id,
     message,
     system_p,
-    humanize,
-    research,
-    research_query,
-    research_max_results,
-    research_provider,
-    analysis,
-    prediction,
-    forecast
+    humanize
   } = req.body;
   const userId = asString(user_id);
   const userMessage = asString(message);
   const systemPrompt = asString(system_p);
   const humanizeReply = shouldHumanizeResponse(humanize);
-  // Research is opt-in: an explicit truthy `research` field (same parsing as
-  // `humanize`, so form-encoded 'true' works) always triggers it. Without
-  // that field this endpoint behaves exactly as before unless the operator
-  // enabled RESEARCH_AUTO_TRIGGER, in which case a message that clearly asks
-  // for a lookup counts as the request (see detectResearchIntent).
-  const researchExplicit = parseOptionalBoolean(research, false);
-  const researchAuto = !researchExplicit && RESEARCH_AUTO_TRIGGER && detectResearchIntent(userMessage);
-  const researchRequested = researchExplicit || researchAuto;
-  const researchTrigger = researchExplicit ? 'explicit' : 'auto';
-  const requestedResearchProvider = asString(research_provider).trim().toLowerCase() || undefined;
-  // Tier 2 is opt-in the same way: only an explicit truthy `analysis` field
-  // fetches a dataset or analyzes anything. Ordinary and Tier-1-only
-  // requests never touch it.
-  const analysisRequested = parseOptionalBoolean(analysis, false);
-  // Tier 3 likewise: `prediction: true` (alias `forecast: true`). A
-  // prediction implies the Tier 2 pipeline — it needs a dataset and an
-  // analyzed series to model — so the dataset is fetched at most once and
-  // shared between the two tiers.
-  const predictionRequested = parseOptionalBoolean(prediction ?? forecast, false);
 
   if (!userId || !userMessage) return res.status(400).json({ error: 'Missing user_id or message.' });
   const SYSTEM_PROMPT = systemPrompt && systemPrompt.trim().length
@@ -962,258 +844,12 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
     messages.push({ role: 'system', content: `Memory: ${modelMemory}` });
   }
 
-  // Opt-in research (Tier 1): fetch current/external sources BEFORE the
-  // Mistral call and inject them as one extra system message. Fail-open by
-  // design — a missing key, disabled server, or provider outage degrades to
-  // an ordinary chat reply (reported in meta.research) rather than a 500,
-  // and research results are never written into character facts/memory.
-  //
-  // Fail-open is not fail-silent, though. If the lookup was requested and
-  // returned nothing, the model still gets a system message — the failure
-  // notice — because an unanswered "research X" with no instruction against
-  // improvising is exactly how a confident, source-free, citation-shaped
-  // non-answer gets produced.
-  let researchContext = '';
-  let researchSystemMessage = '';
-  let researchMeta = null;
-  if (researchRequested) {
-    // The query has to name a topic. A bare follow-up ("ok", "sure", "dig
-    // deeper") inherits the topic from the most recent substantive user turn
-    // instead of being searched verbatim — searching "ok" returns the history
-    // of the word, which is how a ridge question got answered with Wikipedia,
-    // Katy Perry and celebrity gossip. With no topic to inherit there is
-    // nothing worth searching, and the turn is answered without a lookup.
-    const explicitQuery = asString(research_query).trim();
-    try {
-      const builtQuery = buildResearchQuery(explicitQuery || userMessage, chatHistory);
-      const query = builtQuery.query;
-      if (!query) {
-        throw new ResearchError(
-          'RESEARCH_NO_QUERY',
-          'No research query could be formed: this message is a short follow-up and no earlier turn in the conversation names a topic.'
-        );
-      }
-      const result = await researchClient.search(query, {
-        maxResults: parseNumber(research_max_results, undefined),
-        provider: requestedResearchProvider
-      });
-      researchContext = formatResearchContext(result, researchClient.maxContextChars);
-      researchSystemMessage = researchContext;
-      researchMeta = {
-        requested: true,
-        trigger: researchTrigger,
-        status: 'ok',
-        provider: result.provider,
-        query: result.query,
-        cached: Boolean(result.cached),
-        sources: result.results.map(source => ({ title: source.title, url: source.url }))
-      };
-    } catch (error) {
-      const details = describeResearchError(error);
-      const unavailable = [
-        'RESEARCH_DISABLED',
-        'RESEARCH_NOT_CONFIGURED',
-        'RESEARCH_UNKNOWN_PROVIDER',
-        'RESEARCH_NO_QUERY'
-      ].includes(error && error.code);
-      researchMeta = {
-        requested: true,
-        trigger: researchTrigger,
-        status: unavailable ? 'unavailable' : 'error',
-        error: details,
-        ...(requestedResearchProvider ? { provider: requestedResearchProvider } : {})
-      };
-      researchSystemMessage = formatResearchFailureNotice(details);
-      // describeResearchError never includes headers — safe to log.
-      console.warn(`Research failed for /wrestling_chat request: ${details}`);
-    }
-  }
-  // (The research message is pushed AFTER the chat history — see below.)
-
-  // The gap the failure notice does not cover, and the commonest path of all:
-  // no lookup was requested, so nothing ran and nothing came back. A message
-  // like "research the two Atlantic ridge earthquakes" reads as an explicit
-  // request to the user but is an ordinary string to this API — and with
-  // RESEARCH_AUTO_TRIGGER off (the default) it reaches the model with no
-  // sources and no instruction about sourcing. That is the state in which a
-  // chat model invents the archive sweep, the negative result and the
-  // citations. Telling it plainly that no lookup ran costs no network call,
-  // which is why this guard is on by default.
-  let noLiveDataNotice = '';
-  if (!researchRequested && RESEARCH_NO_DATA_GUARD && detectResearchIntent(userMessage)) {
-    noLiveDataNotice = formatNoLiveDataNotice();
-  }
-
-  // Opt-in data analysis (Tier 2) and predictive modeling (Tier 3) share
-  // one dataset resolution: resolve the dataset (structured provider or
-  // inline rows), compute every number locally, and inject only those
-  // computed results. The model narrates; it never does the math and never
-  // invents a forecast. Fail-open exactly like Tier 1, and dataset /
-  // analysis / forecast content is never written into character facts.
-  let analysisContext = '';
-  let analysisMeta = null;
-  let forecastContext = '';
-  let predictionMeta = null;
-  if (analysisRequested || predictionRequested) {
-    let dataset = null;
-    let summary = null;
-    try {
-      dataset = await dataClient.fetchDataset(buildDatasetSpec(req.body));
-      summary = analyzeDataset(
-        dataset.rows,
-        analysisOptionsFor(req.body, dataset.defaults || {})
-      );
-    } catch (error) {
-      const details = describeDataError(error);
-      const unavailable = [
-        'ANALYSIS_DISABLED',
-        'DATA_NOT_PROVIDED',
-        'DATA_UNKNOWN_PROVIDER'
-      ].includes(error && error.code);
-      const status = unavailable ? 'unavailable' : 'error';
-      if (analysisRequested) {
-        analysisMeta = { requested: true, status, error: details };
-      }
-      if (predictionRequested) {
-        // No dataset → no series → nothing to model. Reported on the
-        // prediction block the caller actually asked for.
-        predictionMeta = { requested: true, status, error: details };
-      }
-      // describeDataError never includes headers — safe to log.
-      console.warn(`Dataset resolution failed for /wrestling_chat request: ${details}`);
-    }
-
-    if (dataset && summary) {
-      let forecastComputed = false;
-      if (predictionRequested) {
-        try {
-          const forecastResult = forecaster.forecast(
-            dataset.rows,
-            forecastOptionsFor(req.body, summary.selection || {})
-          );
-          forecastComputed = true;
-          forecastContext = formatForecastContext(dataset, forecastResult, forecaster.maxContextChars);
-          predictionMeta = {
-            requested: true,
-            status: 'ok',
-            dataset: {
-              provider: dataset.provider,
-              description: dataset.description,
-              rowCount: dataset.rows.length
-            },
-            forecast: forecastResult
-          };
-        } catch (error) {
-          if (error && error.code === 'FORECAST_INSUFFICIENT') {
-            // Refusal is a first-class outcome: the model is told to explain
-            // why no responsible forecast exists instead of guessing one.
-            const reasons = (error.reasons && error.reasons.length) ? error.reasons : [error.message];
-            forecastContext = formatForecastRefusalContext(reasons, forecaster.maxContextChars);
-            predictionMeta = { requested: true, status: 'insufficient', reasons };
-          } else {
-            const details = error && error.message ? error.message : String(error);
-            const unavailable = ['FORECAST_DISABLED', 'FORECAST_BAD_METHOD'].includes(error && error.code);
-            predictionMeta = {
-              requested: true,
-              status: unavailable ? 'unavailable' : 'error',
-              error: details
-            };
-          }
-          console.warn(`Forecast failed for /wrestling_chat request: ${predictionMeta.error || (predictionMeta.reasons || []).join(' ')}`);
-        }
-      }
-
-      if (analysisRequested) {
-        analysisContext = formatAnalysisContext(
-          dataset,
-          summary,
-          dataClient.maxContextChars,
-          { forecastComputed }
-        );
-        analysisMeta = {
-          requested: true,
-          status: 'ok',
-          dataset: {
-            provider: dataset.provider,
-            description: dataset.description,
-            rowCount: dataset.rows.length,
-            ...(dataset.truncated ? { truncated: true } : {}),
-            ...(dataset.cached ? { cached: true } : {})
-          },
-          summary
-        };
-      }
-    }
-  }
-  if (analysisContext) {
-    messages.push({ role: 'system', content: analysisContext });
-  }
-  if (forecastContext) {
-    messages.push({ role: 'system', content: forecastContext });
-  }
-
-  // Replayed assistant turns get their citation markers stripped from the
-  // prompt copy (stored history is untouched). Those markers were never backed
-  // by anything — the model cannot cite sources it was not given — and leaving
-  // them in the context is precisely what let an invented "[1]" be copied
-  // forward as though it pointed somewhere. The claims themselves stay in
-  // history; only the false attribution goes.
-  chatHistory.forEach(msg => {
-    const content = msg.role === 'assistant' ? stripCitationMarkers(msg.content) : msg.content;
-    messages.push({ role: msg.role, content });
-  });
-
-  // The research message goes last, immediately before generation, rather than
-  // buried above a 10-turn history. It is the constraint that matters most on
-  // a lookup-shaped turn, and instructions that sit furthest from the point of
-  // generation carry the least weight.
-  if (researchSystemMessage) {
-    messages.push({ role: 'system', content: researchSystemMessage });
-  }
-  if (noLiveDataNotice) {
-    messages.push({ role: 'system', content: noLiveDataNotice });
-  }
+  chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
 
   try {
-    // Enhanced (research/analysis/forecast) replies need more room than the
-    // 250-token chat default; only the token cap changes, and only on
-    // requests that asked for one of the enhanced modes. A forecast-refusal
-    // block counts: the model needs room to explain the refusal. So do the
-    // research notices — an honest "I could not retrieve anything" reply, or
-    // an in-persona "I can't check live data, here's what I can offer", needs
-    // the same room as a sourced one.
-    const rawReply = (researchSystemMessage || noLiveDataNotice || analysisContext || forecastContext)
-      ? await mistral.chat(messages, { max_tokens: RESEARCH_MAX_TOKENS })
-      : await mistral.chat(messages);
-
-    // Enforcement, not just audit: on a lookup-shaped turn, markers the model
-    // cannot justify are removed from the reply before it is returned or
-    // stored. Four consecutive answers cited sources that were never supplied
-    // — advice had stopped being a control, so this is the deterministic one.
-    // Storing the sanitized text is what stops the loop: the next turn is not
-    // handed back its own fabricated markers as history.
-    const citationSources = (researchMeta && researchMeta.sources || []).length;
-    const guardedCitations = sanitizeFabricatedCitations(rawReply, citationSources);
-    const guardedReply = (researchRequested || noLiveDataNotice) ? guardedCitations.text : rawReply;
-
-    const botReply = humanizeReply ? humanizeResponse(guardedReply) : guardedReply;
+    const rawReply = await mistral.chat(messages);
+    const botReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
     await storeMessage(userId, botReply, 'assistant', CHAT_SCOPE);
-
-    // Compare the citation markers the model wrote against the sources it was
-    // actually given. Diagnostic — the reply itself was already sanitized
-    // above — but it makes an unauditable claim auditable: on a failed lookup
-    // the source count is 0, so any [1]/[2] the model emitted is reported as
-    // an invalid citation instead of shipping as if it pointed at something.
-    // `stripped` lists what the sanitizer actually removed from the reply.
-    if (researchRequested) {
-      researchMeta = {
-        ...researchMeta,
-        citations: {
-          ...auditCitations(rawReply, (researchMeta && researchMeta.sources || []).length),
-          stripped: guardedCitations.removed
-        }
-      };
-    }
 
     // Memory update logic (simple)
     let updatedFacts = characterFacts;
@@ -1227,19 +863,6 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
       await updateCharacterFacts(userId, updatedFacts, CHAT_SCOPE);
     }
 
-    // Backward compatible: the plain { response } shape is unchanged unless
-    // the caller opted into research, analysis, and/or prediction, which add
-    // their meta blocks alongside it.
-    if (researchRequested || analysisRequested || predictionRequested) {
-      return res.json({
-        response: botReply,
-        meta: {
-          ...(researchRequested ? { research: researchMeta } : {}),
-          ...(analysisRequested ? { analysis: analysisMeta } : {}),
-          ...(predictionRequested ? { prediction: predictionMeta } : {})
-        }
-      });
-    }
     res.json({ response: botReply });
   } catch (error) {
     const details = describeMistralError(error);
@@ -1256,20 +879,6 @@ if (require.main === module) {
       const port = process.env.PORT || 8080;
       const server = app.listen(port, '0.0.0.0', () => {
         console.log(`Wrestling bot API running on port ${port}`);
-        // One line that answers "is this deployment running the research
-        // grounding fixes?" from the logs alone — three separate incidents
-        // were diagnosed against a service that turned out not to be running
-        // the merged code. Provider NAMES only; never a key.
-        console.log([
-          'Research guards:',
-          `enabled=${researchClient.enabled}`,
-          `providers=[${researchClient.configuredProviders.join(',') || 'none'}]`,
-          `autoTrigger=${RESEARCH_AUTO_TRIGGER}`,
-          `noDataGuard=${RESEARCH_NO_DATA_GUARD}`,
-          'dateStamp=on',
-          'failureNotice=on',
-          'citationAudit=on'
-        ].join(' '));
       });
       server.keepAliveTimeout = 61000;
       server.headersTimeout = 62000;

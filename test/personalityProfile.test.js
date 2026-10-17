@@ -3,12 +3,23 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  ANALYST_SYSTEM_PROMPT,
   parseJsonFromModel,
   normalizeProfile,
   buildSystemPrompt,
   collectBodyDocuments,
   combineSources
 } = require('../personalityProfile');
+
+test('analyst prompt uses the academic psychologist method', () => {
+  assert.match(ANALYST_SYSTEM_PROMPT, /You are Psychologist/);
+  assert.match(ANALYST_SYSTEM_PROMPT, /Big Five/);
+  assert.match(ANALYST_SYSTEM_PROMPT, /attachment/i);
+  assert.match(ANALYST_SYSTEM_PROMPT, /Vaillant/);
+  assert.match(ANALYST_SYSTEM_PROMPT, /Never reduce a person to a diagnosis/);
+  assert.match(ANALYST_SYSTEM_PROMPT, /People are not their DSM codes/);
+  assert.match(ANALYST_SYSTEM_PROMPT, /Observe before diagnosing/);
+});
 
 test('parseJsonFromModel accepts fenced JSON', () => {
   const parsed = parseJsonFromModel('```json\n{"person_name":"Ada","summary":"Inventor."}\n```');
@@ -36,6 +47,38 @@ test('normalizeProfile coerces strings and marks indicators as not diagnoses', (
   assert.match(profile.disclaimer, /Not a clinical/);
   assert.equal(profile.speech_patterns.tone, 'dry');
   assert.deepEqual(profile.values, ['honesty']);
+  assert.equal(profile.big_five.openness.level, '');
+  assert.match(profile.disclaimer, /DSM codes/);
+});
+
+test('normalizeProfile keeps Big Five, attachment, defenses, and relational dynamics', () => {
+  const profile = normalizeProfile({
+    person_name: 'Sam',
+    big_five: { extraversion: { level: 'Low', manifestation: 'writes instead of calling', evidence: 'every entry is a letter' } },
+    attachment: { style: 'Dismissive-Avoidant', relationship_pattern: 'pulls away when asked to stay', triggered_by: 'neediness' },
+    defense_mechanisms: { primary: ['intellectualization'], under_stress: ['withdrawal'] },
+    core_wound: 'left behind',
+    coping_strategy: { adaptive: 'work', maladaptive: 'silence' },
+    blind_spot: 'how much they want to be chosen',
+    cognitive_distortions: [{ label: 'mind reading' }],
+    relationships: [{
+      name: 'Dad',
+      nature: 'estranged',
+      model: 'Attachment',
+      power_dynamic: 'Complementary',
+      unspoken_contract: 'do not ask',
+      trigger_points: 'phone calls'
+    }]
+  });
+
+  assert.equal(profile.big_five.extraversion.level, 'Low');
+  assert.equal(profile.big_five.neuroticism.level, '');
+  assert.equal(profile.attachment.style, 'Dismissive-Avoidant');
+  assert.equal(profile.defense_mechanisms.primary[0].label, 'intellectualization');
+  assert.equal(profile.core_wound.label, 'left behind');
+  assert.equal(profile.coping_strategy.adaptive, 'work');
+  assert.equal(profile.relationships[0].unspoken_contract, 'do not ask');
+  assert.equal(profile.relationships[0].trigger_points, 'phone calls');
 });
 
 test('buildSystemPrompt recreates the person in first person', () => {
@@ -51,7 +94,10 @@ test('buildSystemPrompt recreates the person in first person', () => {
     },
     ideologies: [{ label: 'self-reliance', description: 'asks for nothing' }],
     values: ['loyalty'],
-    fears: ['being a burden']
+    fears: ['being a burden'],
+    big_five: { extraversion: { level: 'Low', manifestation: 'writes instead of calling' } },
+    attachment: { style: 'Dismissive-Avoidant', triggered_by: 'being needed' },
+    core_wound: { label: 'left behind' }
   });
 
   assert.match(prompt, /You are Mara Quinn/);
@@ -59,6 +105,9 @@ test('buildSystemPrompt recreates the person in first person', () => {
   assert.match(prompt, /guarded/);
   assert.match(prompt, /self-reliance/);
   assert.match(prompt, /I already said no/);
+  assert.match(prompt, /extraversion/);
+  assert.match(prompt, /Dismissive-Avoidant/);
+  assert.match(prompt, /left behind/);
 });
 
 test('collectBodyDocuments reads document, text, and documents[]', () => {

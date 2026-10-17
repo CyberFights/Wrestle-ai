@@ -36,7 +36,7 @@ Optional:
   field can still override the server default for that response.
 - `PROFILE_CONTEXT_CHAR_LIMIT` — how many characters of source documents are sent to the
   model when building a personality profile (default `24000`).
-- `PROFILE_MAX_TOKENS` — model reply token cap for `POST /personality_profile` (default `3500`).
+- `PROFILE_MAX_TOKENS` — model reply token cap for `POST /personality_profile` (default `4000`).
 - `PROFILE_UPLOAD_MAX_BYTES` — per-file upload limit for profile documents (default `8388608`).
 
 ## Mistral API errors
@@ -76,8 +76,11 @@ move/stamina sanitizer, so the existing `your turn.` and move-limit rules still 
 
 Upload a journal, letter, transcript, or any text document about a person and the server
 builds a **psychological profile** plus an **AI system prompt** that recreates their voice.
-The profile is stored in that caller's own memory folder (`<base>_profiles`), keyed by the
-person's name — isolated from chat, battle, and UGCW memory.
+Analysis follows the Academic Psychologist method (Big Five, attachment theory, Vaillant
+defenses, CBT distortions, relational models): observe evidence first, name the framework
+and its limits, never reduce a person to a DSM code. The profile is stored in that
+caller's own memory folder (`<base>_profiles`), keyed by the person's name — isolated from
+chat, battle, and UGCW memory.
 
 ```js
 await fetch(`${apiUrl}/personality_profile`, {
@@ -103,6 +106,14 @@ What comes back:
   "person_key": "mara_quinn",
   "profile": {
     "summary": "…",
+    "frameworks_used": [{ "name": "Big Five", "limitations": "…" }],
+    "big_five": { "extraversion": { "level": "Low", "manifestation": "writes instead of calling" } },
+    "attachment": { "style": "Dismissive-Avoidant", "triggered_by": "being needed" },
+    "defense_mechanisms": { "primary": [{ "label": "intellectualization" }], "under_stress": [] },
+    "core_wound": { "label": "…" },
+    "coping_strategy": { "adaptive": "…", "maladaptive": "…" },
+    "blind_spot": { "label": "…" },
+    "cognitive_distortions": [],
     "personality_traits": [{ "trait": "guarded", "evidence": "…", "confidence": "high" }],
     "characteristics": [],
     "mindsets": [],
@@ -112,6 +123,7 @@ What comes back:
     "values": [],
     "fears": [],
     "motivations": [],
+    "relationships": [{ "name": "Dad", "model": "Attachment", "unspoken_contract": "…" }],
     "disclaimer": "Inferred from the supplied documents for persona recreation only. …"
   },
   "system_prompt": "You are Mara Quinn. Stay in character…",
@@ -121,8 +133,8 @@ What comes back:
 ```
 
 `psychological_indicators` are **inferred from the text for persona recreation only** — not
-a clinical diagnosis or medical advice. Feed `system_prompt` back as `system_p` on
-`/wrestling_chat` (or any chat client) to speak as that person.
+a clinical diagnosis or medical advice. Traits are not diagnoses. Feed `system_prompt` back
+as `system_p` on `/wrestling_chat` (or any chat client) to speak as that person.
 
 Read a saved profile with `GET /personality_profile?user_id=…&person_name=…`. List everyone
 stored for a caller with `GET /personality_profiles?user_id=…`.

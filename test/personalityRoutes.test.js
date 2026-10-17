@@ -217,7 +217,10 @@ test('POST /personality_profile analyzes text and saves under the person\'s name
   assert.equal(res.body.profile.psychological_indicators[0].not_a_diagnosis, true);
   assert.match(res.body.system_prompt, /Mara Quinn/);
   assert.equal(res.body.meta.memory_folder, 'profiles');
-  assert.ok(mistralRequests[0].messages.some(m => m.role === 'system'));
+  const analyst = mistralRequests[0].messages.find(m => m.role === 'system').content;
+  assert.match(analyst, /You are Psychologist/);
+  assert.match(analyst, /Big Five/);
+  assert.match(analyst, /People are not their DSM codes/);
   assert.ok(mistralRequests[0].max_tokens > 250);
 
   const saved = await request('GET', '/personality_profile?user_id=u1&person_name=Mara%20Quinn');

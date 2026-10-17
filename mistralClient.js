@@ -90,11 +90,12 @@ function createMistralClient(options = {}) {
       max_tokens: overrides.max_tokens ?? 250,
       temperature: overrides.temperature ?? 0.8
     };
+    const requestTimeoutMs = toPositiveInt(overrides.timeoutMs, timeoutMs);
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       try {
         const response = await axios.post(url, body, {
-          timeout: timeoutMs,
+          timeout: requestTimeoutMs,
           headers: {
             Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json'

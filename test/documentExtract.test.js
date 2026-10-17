@@ -60,3 +60,14 @@ test('rejects images and other non-documents', async () => {
     err => err instanceof DocumentExtractError && err.code === 'UNSUPPORTED_TYPE'
   );
 });
+
+test('accepts an image when a transcript is provided', async () => {
+  const result = await extractDocument({
+    buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]),
+    filename: 'face.png',
+    mimetype: 'image/png',
+    transcript: 'She is standing by the lake house.'
+  });
+  assert.match(result.text, /lake house/);
+  assert.equal(result.via, 'transcript');
+});

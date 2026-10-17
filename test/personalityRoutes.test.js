@@ -38,6 +38,15 @@ const fakeMemoryStore = {
     const now = new Date();
     const id = `${userId}|${key}`;
     const prev = profiles.get(id);
+    const revisions = Array.isArray(prev && prev.revisions) ? prev.revisions.slice() : [];
+    if (prev) {
+      revisions.push({
+        saved_at: prev.updated_at,
+        profile: prev.profile,
+        memories: prev.memories,
+        system_prompt: prev.system_prompt
+      });
+    }
     const doc = {
       _id: key,
       user_id: String(userId),
@@ -47,6 +56,9 @@ const fakeMemoryStore = {
       memories: record.memories || (record.profile && record.profile.memories) || [],
       system_prompt: record.system_prompt,
       sources: record.sources || [],
+      source_archive: record.documents || record.source_archive || (prev && prev.source_archive) || [],
+      revisions,
+      consent: Object.prototype.hasOwnProperty.call(record || {}, 'consent') ? record.consent : (prev && prev.consent),
       created_at: prev ? prev.created_at : now,
       updated_at: now
     };
@@ -55,6 +67,64 @@ const fakeMemoryStore = {
   },
   async getPersonProfile(userId, personName) {
     return profiles.get(`${userId}|${personKey(personName)}`) || null;
+  },
+  async patchPersonProfile(userId, personName, patch = {}) {
+    const existing = await fakeMemoryStore.getPersonProfile(userId, personName);
+    if (!existing) return null;
+    return fakeMemoryStore.savePersonProfile(userId, existing.person_name, {
+      profile: { ...(existing.profile || {}), ...(patch.profile || {}) },
+      memories: patch.memories != null ? patch.memories : existing.memories,
+      system_prompt: patch.system_prompt != null ? patch.system_prompt : existing.system_prompt,
+      sources: existing.sources,
+      consent: patch.consent !== undefined ? patch.consent : existing.consent
+    });
+  },
+  async deletePersonProfile(userId, personName) {
+    const id = `${userId}|${personKey(personName)}`;
+    if (!profiles.has(id)) return false;
+    profiles.delete(id);
+    return true;
+  },
+  async patchPersonMemory(userId, personName, memoryId, patch = {}) {
+    const existing = await fakeMemoryStore.getPersonProfile(userId, personName);
+    if (!existing) return null;
+    const memories = (existing.memories || []).slice();
+    const index = memories.findIndex(mem => mem && String(mem.id) === String(memoryId));
+    if (index < 0) return null;
+    memories[index] = { ...memories[index], ...patch, id: memories[index].id };
+    await fakeMemoryStore.savePersonProfile(userId, existing.person_name, {
+      profile: { ...existing.profile, memories },
+      memories,
+      system_prompt: existing.system_prompt,
+      sources: existing.sources,
+      consent: existing.consent
+    });
+    return memories[index];
+  },
+  async deletePersonMemory(userId, personName, memoryId) {
+    const existing = await fakeMemoryStore.getPersonProfile(userId, personName);
+    if (!existing) return null;
+    const memories = (existing.memories || []).filter(mem => mem && String(mem.id) !== String(memoryId));
+    if (memories.length === (existing.memories || []).length) return null;
+    return fakeMemoryStore.savePersonProfile(userId, existing.person_name, {
+      profile: { ...existing.profile, memories },
+      memories,
+      system_prompt: existing.system_prompt,
+      sources: existing.sources,
+      consent: existing.consent
+    });
+  },
+  async restorePersonProfileRevision(userId, personName, index) {
+    const existing = await fakeMemoryStore.getPersonProfile(userId, personName);
+    if (!existing || !existing.revisions || !existing.revisions[Number(index)]) return null;
+    const rev = existing.revisions[Number(index)];
+    return fakeMemoryStore.savePersonProfile(userId, existing.person_name, {
+      profile: rev.profile,
+      memories: rev.memories,
+      system_prompt: rev.system_prompt,
+      sources: existing.sources,
+      consent: existing.consent
+    });
   },
   async listPersonProfiles(userId) {
     const rows = [];
@@ -285,4 +355,77 @@ test('POST /personality_profile accepts an uploaded text file', async () => {
 test('GET /personality_profile 404s when nobody is stored', async () => {
   const res = await request('GET', '/personality_profile?user_id=u1&person_name=Nobody');
   assert.equal(res.status, 404);
+});
+
+test('POST /personality_profile rejects consent: false and notes privacy otherwise', async () => {
+  const denied = await request('POST', '/personality_profile', {
+    user_id: 'u-consent',
+    person_name: 'Mara Quinn',
+    document: 'I cannot sleep.',
+    consent: false
+  });
+  assert.equal(denied.status, 400);
+  assert.match(denied.body.error, /Consent/);
+
+  const ok = await request('POST', '/personality_profile', {
+    user_id: 'u-consent',
+    person_name: 'Mara Quinn',
+    document: 'I cannot sleep. I already said no.'
+  });
+  assert.equal(ok.status, 200);
+  assert.match(ok.body.privacy_notice, /permission/i);
+});
+
+test('POST /wrestling_chat with person_name does not humanize by default and raises the token cap', async () => {
+  mistralRequests.length = 0;
+  const res = await request('POST', '/wrestling_chat', {
+    user_id: 'u1',
+    person_name: 'Mara Quinn',
+    message: 'What happened with your dad?',
+    system_p: 'Keep answers under two sentences.'
+  });
+  assert.equal(res.status, 200);
+  const sent = mistralRequests[mistralRequests.length - 1];
+  assert.equal(sent.max_tokens, 800);
+  const contents = (sent.messages || []).map(m => m.content).join('\n');
+  assert.match(contents, /Mara Quinn/);
+  assert.match(contents, /Keep answers under two sentences/);
+  assert.match(contents, /Stay consistent with this psychology/);
+});
+
+test('PATCH and DELETE personality_profile and a single memory', async () => {
+  const created = await request('POST', '/personality_profile', {
+    user_id: 'u-edit',
+    person_name: 'Mara Quinn',
+    document: 'I write after midnight. I already said no.'
+  });
+  assert.equal(created.status, 200);
+  const memoryId = created.body.memories[0].id;
+  assert.ok(memoryId);
+
+  const patched = await request('PATCH', '/personality_profile', {
+    user_id: 'u-edit',
+    person_name: 'Mara Quinn',
+    profile: { summary: 'Rewritten summary.' }
+  });
+  assert.equal(patched.status, 200);
+  assert.equal(patched.body.profile.summary, 'Rewritten summary.');
+
+  const mem = await request('PATCH', '/personality_profile/memory', {
+    user_id: 'u-edit',
+    person_name: 'Mara Quinn',
+    memory_id: memoryId,
+    patch: { importance: 'low' }
+  });
+  assert.equal(mem.status, 200);
+  assert.equal(mem.body.memory.importance, 'low');
+
+  const removedMem = await request('DELETE', `/personality_profile/memory?user_id=u-edit&person_name=Mara%20Quinn&memory_id=${memoryId}`);
+  assert.equal(removedMem.status, 200);
+  assert.equal(removedMem.body.memories.some(m => m.id === memoryId), false);
+
+  const gone = await request('DELETE', '/personality_profile?user_id=u-edit&person_name=Mara%20Quinn');
+  assert.equal(gone.status, 200);
+  const missing = await request('GET', '/personality_profile?user_id=u-edit&person_name=Mara%20Quinn');
+  assert.equal(missing.status, 404);
 });

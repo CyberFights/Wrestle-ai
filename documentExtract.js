@@ -6,7 +6,8 @@
  * dependencies (pdf-parse / mammoth) when they are installed.
  *
  * Binary types that are not documents (images, audio, video, archives other
- * than docx) are rejected rather than being sent to the model as garbage.
+ * than docx) are rejected rather than being sent to the model as garbage,
+ * unless the caller also provides a `transcript` (OCR or audio transcript).
  */
 
 const path = require('path');
@@ -159,20 +160,38 @@ async function extractDocx(buffer) {
   return String(result && result.value ? result.value : '').trim();
 }
 
-async function extractDocument({ buffer, filename, mimetype } = {}) {
-  if (!buffer || !buffer.length) {
-    throw new DocumentExtractError('EMPTY_DOCUMENT', `No content in ${filename || 'upload'}.`);
-  }
+function isImageOrAudio(filename, mimetype) {
+  const ext = extensionOf(filename);
+  const mime = String(mimetype || '').toLowerCase();
+  if (mime.startsWith('image/') || mime.startsWith('audio/')) return true;
+  return ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tif', '.tiff',
+    '.mp3', '.wav', '.ogg', '.flac', '.m4a'].includes(ext);
+}
 
+async function extractDocument({ buffer, filename, mimetype, transcript } = {}) {
   const name = filename || 'upload';
+  const note = String(transcript || '').trim();
   const ext = extensionOf(name);
   const mime = String(mimetype || '').toLowerCase();
   const magic = sniffMagic(buffer);
 
+  if ((!buffer || !buffer.length) && note && isImageOrAudio(name, mime)) {
+    const text = `[Transcript for ${name}]\n${note}`;
+    return { filename: name, text, charCount: text.length, via: 'transcript' };
+  }
+
+  if (!buffer || !buffer.length) {
+    throw new DocumentExtractError('EMPTY_DOCUMENT', `No content in ${filename || 'upload'}.`);
+  }
+
   if (isUnsupportedBinary(name, mime, magic)) {
+    if (note && isImageOrAudio(name, mime)) {
+      const text = `[Transcript for ${name}]\n${note}`;
+      return { filename: name, text, charCount: text.length, via: 'transcript' };
+    }
     throw new DocumentExtractError(
       'UNSUPPORTED_TYPE',
-      `Cannot extract text from ${name}. Upload a document (txt, md, json, html, csv, rtf, pdf, docx) or paste the text.`
+      `Cannot extract text from ${name}. Upload a document (txt, md, json, html, csv, rtf, pdf, docx), paste the text, or send a transcript with the image/audio.`
     );
   }
 

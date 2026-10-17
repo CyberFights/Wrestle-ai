@@ -11,8 +11,13 @@ const {
   formatMemoriesForModel,
   buildSystemPrompt,
   collectBodyDocuments,
-  combineSources
+  combineSources,
+  retrieveMemories,
+  mergeSystemPrompts,
+  detectPerspective,
+  withMemoryIds
 } = require('../personalityProfile');
+const { chunkDocuments, mergeMemoriesWithConflicts, PRIVACY_NOTICE } = require('../personaMemory');
 
 test('analyst prompt uses the academic psychologist method', () => {
   assert.match(ANALYST_SYSTEM_PROMPT, /You are Psychologist/);
@@ -180,4 +185,56 @@ test('combineSources caps total characters and records excerpts', () => {
   assert.equal(sources[0].filename, 'a.txt');
   assert.ok(sources[0].excerpt.length <= 800);
   assert.equal(typeof truncated, 'boolean');
+});
+
+test('retrieveMemories ranks by query overlap', () => {
+  const picked = retrieveMemories([
+    { title: 'the lake house', content: 'Summers at the lake.', type: 'place' },
+    { title: 'Dad stopped calling', content: 'He stopped calling after the funeral.', who: ['Dad'], type: 'event', importance: 'high' }
+  ], 'what happened with your dad?');
+  assert.equal(picked[0].title, 'Dad stopped calling');
+});
+
+test('contradictory memories are marked disputed instead of dropped', () => {
+  const merged = mergeMemoriesWithConflicts(
+    [{ type: 'fact', title: 'birthday', content: 'Born in June.' }],
+    [{ type: 'fact', title: 'birthday', content: 'Born in January.' }]
+  );
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].disputed, true);
+  assert.match(`${merged[0].content} ${merged[0].conflict}`, /June/);
+  assert.match(`${merged[0].content} ${merged[0].conflict}`, /January/);
+});
+
+test('chunkDocuments splits long sources', () => {
+  const chunks = chunkDocuments([{ filename: 'big.txt', text: 'abcdefghij'.repeat(1000) }], 500, 50);
+  assert.ok(chunks.length > 1);
+  assert.equal(chunks[0].filename, 'big.txt');
+});
+
+test('mergeSystemPrompts keeps the persona and appends caller instructions', () => {
+  const merged = mergeSystemPrompts('You are Mara.', 'Be brief.');
+  assert.match(merged, /You are Mara/);
+  assert.match(merged, /Be brief/);
+  assert.match(merged, /do not break character/);
+});
+
+test('detectPerspective distinguishes first-person journals', () => {
+  assert.equal(
+    detectPerspective('I cannot sleep. I already said no. I did not tell Dad. My house ticks. I write at night. I keep my own counsel.'),
+    'first-person'
+  );
+});
+
+test('withMemoryIds is stable for the same content', () => {
+  const [a] = withMemoryIds([{ type: 'event', title: 'x', content: 'y' }]);
+  const [b] = withMemoryIds([{ type: 'event', title: 'x', content: 'y' }]);
+  assert.equal(a.id, b.id);
+  assert.match(PRIVACY_NOTICE, /permission/);
+});
+
+test('collectBodyDocuments accepts a transcript field', () => {
+  const docs = collectBodyDocuments({ transcript: 'She said hello from the recording.' });
+  assert.equal(docs[0].filename, 'transcript.txt');
+  assert.match(docs[0].text, /recording/);
 });

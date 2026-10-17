@@ -18,6 +18,7 @@ const {
   factsFolderNameForUser,
   profilesFolderNameForUser,
   personKeyForName,
+  personaScopeFor,
   isUserFolderName,
   isChatFolderName,
   isFactsFolderName,
@@ -150,6 +151,19 @@ test('profiles live in their own folder under the person\'s name key', () => {
   assert.equal(personKeyForName('Jane Doe'), 'jane_doe');
   assert.equal(personKeyForName('  Jane   DOE '), 'jane_doe');
   assert.notEqual(personKeyForName('alice'), personKeyForName('bob'));
+});
+
+test('persona chat history lives in a short hashed chats folder', () => {
+  const scope = personaScopeFor('Mara Quinn');
+  const name = chatFolderNameForUser('12345', scope);
+  assert.match(name, /^memory_r_12345_chats_p_[a-f0-9]{8}$/);
+  assert.ok(isChatFolderName(name));
+  assert.notEqual(name, chatFolderNameForUser('12345'));
+  assert.ok(Buffer.byteLength(chatFolderNameForUser('a'.repeat(60), scope), 'utf8') <= MONGO_NAME_LIMIT);
+  assert.notEqual(
+    chatFolderNameForUser('12345', personaScopeFor('Mara Quinn')),
+    chatFolderNameForUser('12345', personaScopeFor('Nia Vale'))
+  );
 });
 
 test('name predicates classify the battle-scoped folders', () => {

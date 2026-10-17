@@ -40,6 +40,9 @@ Optional:
 - `PROFILE_UPLOAD_MAX_BYTES` — per-file upload limit for profile documents (default `8388608`).
 - `PROFILE_MEMORY_LIMIT` — max extracted memories stored per person (default `200`).
 - `PROFILE_MEMORY_CHAR_LIMIT` — how many characters of those memories are sent to the model (default `6000`).
+- `PERSONA_CHAT_MAX_TOKENS` — model reply token cap when `/wrestling_chat` uses `person_name` (default `800`).
+- `PROFILE_SOURCE_ARCHIVE_LIMIT` — max characters of original source text kept per person (default `400000`).
+- `PROFILE_REVISION_LIMIT` — how many prior profile snapshots to keep for rollback (default `20`).
 
 ## Mistral API errors
 
@@ -98,7 +101,9 @@ await fetch(`${apiUrl}/personality_profile`, {
 ```
 
 Multipart uploads work too (`files`, `file`, or `document`). Supported types: `txt`, `md`,
-`json`, `html`, `csv`, `rtf`, `pdf`, `docx`. Images and other binaries are rejected.
+`json`, `html`, `csv`, `rtf`, `pdf`, `docx`. Images and audio are rejected unless you also
+send a `transcript` (OCR or audio transcript). Omit `consent` to proceed; `consent: false`
+returns 400. A `privacy_notice` is included on profile responses.
 
 What comes back:
 
@@ -146,10 +151,15 @@ What comes back:
 `psychological_indicators` are **inferred from the text for persona recreation only** — not
 a clinical diagnosis or medical advice. Traits are not diagnoses.
 
-Memories are concrete events, people, places, quotes, and habits taken from the documents.
-They are saved with the profile and injected when the persona speaks, so the model can
-*reference a past it actually has* instead of inventing one. Later uploads merge new
-memories with existing ones (`replace: true` starts over).
+Memories are concrete events, people, places, quotes, and habits taken from the documents
+(profile pass, then a second memory-extraction pass over document chunks). They are saved
+with the profile, given ids, and retrieved by the current chat message so the model can
+*reference a past it actually has* instead of inventing one. Contradictory sources are
+kept as disputed rather than silently overwritten. Later uploads merge new memories with
+existing ones (`replace: true` starts over). Full source text is archived (capped).
+`PATCH` / `DELETE /personality_profile` edit or remove a profile; `PATCH` /
+`DELETE /personality_profile/memory` edit one memory; `POST /personality_profile/restore`
+rolls back a revision.
 
 Speak as that person on chat:
 
@@ -159,8 +169,11 @@ await fetch(`${apiUrl}/wrestling_chat`, {
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
     user_id: userId,
-    person_name: 'Mara Quinn',   // loads system_prompt + memories
+    person_name: 'Mara Quinn',   // loads system_prompt + retrieved memories
     message: 'What happened with your dad?'
+    // humanize: true            // persona replies are not humanized unless you ask
+    // learn_from_chat: true     // optional: extract new memories from this conversation
+    // system_p: extraInstructions // merged with the persona prompt; does not replace it
   })
 });
 ```

@@ -417,6 +417,49 @@ async function updateCharacterFacts(userId, facts, scope) {
 // One document per person name, stored under <base>_profiles. Isolated from
 // chat/battle/ugcw memory so a profile never leaks into those personas.
 
+const SOURCE_ARCHIVE_CHAR_LIMIT = Number(process.env.PROFILE_SOURCE_ARCHIVE_LIMIT) || 400000;
+const REVISION_LIMIT = Number(process.env.PROFILE_REVISION_LIMIT) || 20;
+
+function ensureMemoryIds(memories) {
+  return (Array.isArray(memories) ? memories : []).map((mem, index) => {
+    if (!mem || typeof mem !== 'object') return mem;
+    if (mem.id) return mem;
+    return { ...mem, id: `mem_${index}_${Date.now().toString(36)}` };
+  });
+}
+
+function capSourceArchive(items) {
+  const out = [];
+  let used = 0;
+  for (const item of Array.isArray(items) ? items.slice().reverse() : []) {
+    if (!item) continue;
+    const text = String(item.text || item.content || '').slice(0, SOURCE_ARCHIVE_CHAR_LIMIT);
+    const filename = String(item.filename || item.name || 'source');
+    if (!text) continue;
+    if (used + text.length > SOURCE_ARCHIVE_CHAR_LIMIT) {
+      const room = SOURCE_ARCHIVE_CHAR_LIMIT - used;
+      if (room > 200) {
+        out.push({ filename, text: text.slice(0, room), stored_at: item.stored_at || new Date() });
+      }
+      break;
+    }
+    out.push({ filename, text, stored_at: item.stored_at || new Date() });
+    used += text.length;
+  }
+  return out.reverse();
+}
+
+function snapshotRevision(existing) {
+  if (!existing) return null;
+  return {
+    saved_at: existing.updated_at || new Date(),
+    profile: existing.profile || {},
+    memories: existing.memories || [],
+    system_prompt: existing.system_prompt || '',
+    sources: existing.sources || []
+  };
+}
+
 async function savePersonProfile(userId, personName, record) {
   const id = String(userId);
   const name = String(personName || '').trim();
@@ -424,12 +467,34 @@ async function savePersonProfile(userId, personName, record) {
   const key = personKeyForName(name);
   const now = new Date();
   const folder = await ensureProfilesFolder(id);
-  const existing = await folder.findOne({ _id: key }, { projection: { created_at: 1 } });
-  const memories = Array.isArray(record && record.memories)
-    ? record.memories
-    : (record && record.profile && Array.isArray(record.profile.memories) ? record.profile.memories : []);
-  const profile = record && record.profile ? record.profile : {};
+  const existing = await folder.findOne({ _id: key });
+  const memories = ensureMemoryIds(
+    Array.isArray(record && record.memories)
+      ? record.memories
+      : (record && record.profile && Array.isArray(record.profile.memories) ? record.profile.memories : [])
+  );
+  const profile = record && record.profile ? { ...record.profile } : {};
   if (!Array.isArray(profile.memories)) profile.memories = memories;
+  const incomingArchive = Array.isArray(record && record.source_archive)
+    ? record.source_archive
+    : (Array.isArray(record && record.documents) ? record.documents : []);
+  const source_archive = capSourceArchive([
+    ...((existing && existing.source_archive) || []),
+    ...incomingArchive.map(doc => ({
+      filename: doc.filename || doc.name,
+      text: doc.text || doc.content,
+      stored_at: now
+    }))
+  ]);
+  const revisions = Array.isArray(existing && existing.revisions) ? existing.revisions.slice() : [];
+  const snap = snapshotRevision(existing);
+  if (snap) {
+    revisions.push(snap);
+    if (revisions.length > REVISION_LIMIT) revisions.splice(0, revisions.length - REVISION_LIMIT);
+  }
+  const consent = record && Object.prototype.hasOwnProperty.call(record, 'consent')
+    ? record.consent
+    : (existing && existing.consent);
   const doc = {
     _id: key,
     user_id: id,
@@ -439,6 +504,9 @@ async function savePersonProfile(userId, personName, record) {
     memories,
     system_prompt: record && record.system_prompt != null ? String(record.system_prompt) : '',
     sources: Array.isArray(record && record.sources) ? record.sources : [],
+    source_archive,
+    revisions,
+    consent: consent === undefined ? null : consent,
     updated_at: now
   };
   if (existing && existing.created_at) {
@@ -449,6 +517,87 @@ async function savePersonProfile(userId, personName, record) {
     await folder.updateOne({ _id: key }, { $set: doc }, { upsert: true });
   }
   return doc;
+}
+
+async function patchPersonProfile(userId, personName, patch = {}) {
+  const existing = await getPersonProfile(userId, personName);
+  if (!existing) return null;
+  const profile = { ...(existing.profile || {}), ...(patch.profile || {}) };
+  const memories = patch.memories != null ? ensureMemoryIds(patch.memories) : existing.memories;
+  if (Array.isArray(memories)) profile.memories = memories;
+  const system_prompt = patch.system_prompt != null ? String(patch.system_prompt) : existing.system_prompt;
+  return savePersonProfile(userId, existing.person_name, {
+    profile,
+    memories,
+    system_prompt,
+    sources: existing.sources,
+    source_archive: [],
+    consent: patch.consent !== undefined ? patch.consent : existing.consent
+  });
+}
+
+async function deletePersonProfile(userId, personName) {
+  const id = String(userId);
+  const name = String(personName || '').trim();
+  if (!name) return false;
+  const folder = await ensureProfilesFolder(id);
+  const key = personKeyForName(name);
+  const result = await folder.deleteOne({ _id: key });
+  return result.deletedCount > 0;
+}
+
+function findMemoryIndex(memories, memoryId) {
+  const id = String(memoryId || '');
+  return (memories || []).findIndex(mem => mem && String(mem.id) === id);
+}
+
+async function patchPersonMemory(userId, personName, memoryId, patch = {}) {
+  const existing = await getPersonProfile(userId, personName);
+  if (!existing) return null;
+  const memories = Array.isArray(existing.memories) ? existing.memories.slice() : [];
+  const index = findMemoryIndex(memories, memoryId);
+  if (index < 0) return null;
+  memories[index] = { ...memories[index], ...patch, id: memories[index].id };
+  const saved = await savePersonProfile(userId, existing.person_name, {
+    profile: { ...(existing.profile || {}), memories },
+    memories,
+    system_prompt: existing.system_prompt,
+    sources: existing.sources,
+    source_archive: [],
+    consent: existing.consent
+  });
+  return saved.memories[index];
+}
+
+async function deletePersonMemory(userId, personName, memoryId) {
+  const existing = await getPersonProfile(userId, personName);
+  if (!existing) return null;
+  const memories = (existing.memories || []).filter(mem => mem && String(mem.id) !== String(memoryId));
+  if (memories.length === (existing.memories || []).length) return null;
+  return savePersonProfile(userId, existing.person_name, {
+    profile: { ...(existing.profile || {}), memories },
+    memories,
+    system_prompt: existing.system_prompt,
+    sources: existing.sources,
+    source_archive: [],
+    consent: existing.consent
+  });
+}
+
+async function restorePersonProfileRevision(userId, personName, index) {
+  const existing = await getPersonProfile(userId, personName);
+  if (!existing) return null;
+  const revisions = existing.revisions || [];
+  const rev = revisions[Number(index)];
+  if (!rev) return null;
+  return savePersonProfile(userId, existing.person_name, {
+    profile: rev.profile,
+    memories: rev.memories,
+    system_prompt: rev.system_prompt,
+    sources: rev.sources,
+    source_archive: [],
+    consent: existing.consent
+  });
 }
 
 async function getPersonProfile(userId, personName) {
@@ -494,6 +643,11 @@ module.exports = {
   savePersonProfile,
   getPersonProfile,
   listPersonProfiles,
+  patchPersonProfile,
+  deletePersonProfile,
+  patchPersonMemory,
+  deletePersonMemory,
+  restorePersonProfileRevision,
   ensureChatFolder,
   ensureFactsFolder,
   ensureProfilesFolder,

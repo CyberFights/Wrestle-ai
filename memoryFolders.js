@@ -53,6 +53,7 @@ const BATTLE_SCOPE = 'battle';
 const UGCW_SCOPE = 'ugcw';
 const BATTLE_SCOPE_SUFFIX = '_battle';
 const UGCW_SCOPE_SUFFIX = '_ugcw';
+const PERSONA_SCOPE_PREFIX = 'persona:';
 
 // MongoDB collection names max out at 120 bytes; the base name must stay
 // short enough that the longest typed folder name (base + "_chats_battle" or
@@ -81,9 +82,22 @@ function collectionNameForUser(userId) {
 
 // Only the battle scope adds a suffix; the chat scope keeps the original names
 // so pre-existing chat folders remain valid.
+function isPersonaScope(scope) {
+  return typeof scope === 'string' && scope.startsWith(PERSONA_SCOPE_PREFIX);
+}
+
+function personaScopeFor(personName) {
+  return PERSONA_SCOPE_PREFIX + personKeyForName(personName);
+}
+
 function scopeSuffix(scope) {
   if (scope === BATTLE_SCOPE) return BATTLE_SCOPE_SUFFIX;
   if (scope === UGCW_SCOPE) return UGCW_SCOPE_SUFFIX;
+  if (isPersonaScope(scope)) {
+    const key = personKeyForName(scope.slice(PERSONA_SCOPE_PREFIX.length));
+    const short = crypto.createHash('sha256').update(key).digest('hex').slice(0, 8);
+    return `_p_${short}`;
+  }
   return '';
 }
 
@@ -131,7 +145,8 @@ function isChatFolderName(name) {
   return isUserFolderName(name) &&
     (name.endsWith(CHAT_FOLDER_SUFFIX) ||
       name.endsWith(CHAT_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX) ||
-      name.endsWith(CHAT_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX));
+      name.endsWith(CHAT_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX) ||
+      /_chats_p_[a-z0-9_]+$/.test(name));
 }
 
 // True for character facts folders of either scope (<base>_facts or
@@ -157,6 +172,9 @@ module.exports = {
   UGCW_SCOPE,
   BATTLE_SCOPE_SUFFIX,
   UGCW_SCOPE_SUFFIX,
+  PERSONA_SCOPE_PREFIX,
+  isPersonaScope,
+  personaScopeFor,
   scopeSuffix,
   collectionNameForUser,
   chatFolderNameForUser,

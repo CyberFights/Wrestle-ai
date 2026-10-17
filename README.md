@@ -26,6 +26,8 @@ Optional:
   the model (default `6000`). Full memory remains stored in MongoDB.
 - `MISTRAL_MODEL` — Mistral chat model to use (default `mistral-large-latest`).
 - `MISTRAL_TIMEOUT_MS` — per-attempt timeout for Mistral API calls (default `30000`).
+  Personality-profile analysis uses `PROFILE_MISTRAL_TIMEOUT_MS` instead (default `120000`)
+  because a 4000-token profile JSON often needs more than 30 seconds.
 - `MISTRAL_MAX_RETRIES` — how many times a failed Mistral call is retried (default `3`).
   Retries only happen for transient failures — rate limits (429) and server errors
   (5xx, e.g. the 503 Mistral returns when overloaded), plus timeouts and connection
@@ -37,6 +39,10 @@ Optional:
 - `PROFILE_CONTEXT_CHAR_LIMIT` — how many characters of source documents are sent to the
   model when building a personality profile (default `24000`).
 - `PROFILE_MAX_TOKENS` — model reply token cap for `POST /personality_profile` (default `4000`).
+- `PROFILE_MISTRAL_TIMEOUT_MS` — per-attempt Mistral timeout for profile/memory extraction
+  (default `120000`). Battle and casual chat still use `MISTRAL_TIMEOUT_MS`.
+- `PROFILE_MEMORY_CHUNKS` — max document chunks sent through the second memory-extraction
+  pass (default `4`).
 - `PROFILE_UPLOAD_MAX_BYTES` — per-file upload limit for profile documents (default `8388608`).
 - `PROFILE_MEMORY_LIMIT` — max extracted memories stored per person (default `200`).
 - `PROFILE_MEMORY_CHAR_LIMIT` — how many characters of those memories are sent to the model (default `6000`).

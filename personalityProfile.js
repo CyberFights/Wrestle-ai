@@ -33,6 +33,8 @@ const PROFILE_CONTEXT_CHAR_LIMIT = parsePositiveInt(process.env.PROFILE_CONTEXT_
 const PROFILE_MAX_TOKENS = parsePositiveInt(process.env.PROFILE_MAX_TOKENS, 4000);
 const PROFILE_MEMORY_LIMIT = parsePositiveInt(process.env.PROFILE_MEMORY_LIMIT, 200);
 const PROFILE_MEMORY_CHAR_LIMIT = parsePositiveInt(process.env.PROFILE_MEMORY_CHAR_LIMIT, 6000);
+const PROFILE_MISTRAL_TIMEOUT_MS = parsePositiveInt(process.env.PROFILE_MISTRAL_TIMEOUT_MS, 120000);
+const PROFILE_MEMORY_CHUNKS = parsePositiveInt(process.env.PROFILE_MEMORY_CHUNKS, 4);
 const SOURCE_EXCERPT_CHARS = 800;
 const BIG_FIVE_KEYS = ['openness', 'conscientiousness', 'extraversion', 'agreeableness', 'neuroticism'];
 const MEMORY_TYPES = new Set([
@@ -656,7 +658,7 @@ async function filesFromUploads(files = [], options = {}) {
 }
 
 async function extractMemoriesFromChunks({ mistral, personName, documents }) {
-  const chunks = chunkDocuments(documents);
+  const chunks = chunkDocuments(documents).slice(0, PROFILE_MEMORY_CHUNKS);
   if (!chunks.length) return [];
 
   const collected = [];
@@ -674,7 +676,7 @@ async function extractMemoriesFromChunks({ mistral, personName, documents }) {
           ].join('\n\n')
         }
       ],
-      { max_tokens: 1800, temperature: 0.1 }
+      { max_tokens: 1800, temperature: 0.1, timeoutMs: PROFILE_MISTRAL_TIMEOUT_MS }
     );
     try {
       const parsed = parseJsonFromModel(raw);
@@ -702,7 +704,7 @@ async function extractConversationMemories({ mistral, personName, messages }) {
         content: `Subject: ${personName || 'Unknown'}\n\n<conversation>\n${lines}\n</conversation>`
       }
     ],
-    { max_tokens: 800, temperature: 0.1 }
+    { max_tokens: 800, temperature: 0.1, timeoutMs: PROFILE_MISTRAL_TIMEOUT_MS }
   );
   try {
     const parsed = parseJsonFromModel(raw);
@@ -744,7 +746,7 @@ async function analyzePersonDocuments({
       { role: 'system', content: ANALYST_SYSTEM_PROMPT },
       { role: 'user', content: userMessage }
     ],
-    { max_tokens: PROFILE_MAX_TOKENS, temperature: 0.2 }
+    { max_tokens: PROFILE_MAX_TOKENS, temperature: 0.2, timeoutMs: PROFILE_MISTRAL_TIMEOUT_MS }
   );
 
   const parsed = parseJsonFromModel(raw);
@@ -753,7 +755,11 @@ async function analyzePersonDocuments({
 
   let extracted = [];
   try {
-    extracted = await extractMemoriesFromChunks({ mistral, personName: profile.person_name, documents });
+    extracted = await extractMemoriesFromChunks({
+      mistral,
+      personName: profile.person_name,
+      documents: sampled
+    });
   } catch {
     extracted = [];
   }
@@ -781,6 +787,8 @@ module.exports = {
   BIG_FIVE_KEYS,
   PROFILE_CONTEXT_CHAR_LIMIT,
   PROFILE_MAX_TOKENS,
+  PROFILE_MISTRAL_TIMEOUT_MS,
+  PROFILE_MEMORY_CHUNKS,
   PROFILE_MEMORY_LIMIT,
   PROFILE_MEMORY_CHAR_LIMIT,
   PRIVACY_NOTICE,

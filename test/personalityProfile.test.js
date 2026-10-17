@@ -15,9 +15,14 @@ const {
   retrieveMemories,
   mergeSystemPrompts,
   detectPerspective,
-  withMemoryIds
+  withMemoryIds,
+  PROFILE_MISTRAL_TIMEOUT_MS
 } = require('../personalityProfile');
 const { chunkDocuments, mergeMemoriesWithConflicts, PRIVACY_NOTICE } = require('../personaMemory');
+
+test('profile analysis waits longer than a chat turn for Mistral', () => {
+  assert.ok(PROFILE_MISTRAL_TIMEOUT_MS >= 60000);
+});
 
 test('analyst prompt uses the academic psychologist method', () => {
   assert.match(ANALYST_SYSTEM_PROMPT, /You are Psychologist/);

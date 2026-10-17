@@ -108,6 +108,18 @@ test('times out a hung request instead of waiting forever', async t => {
   );
 });
 
+test('chat can raise the timeout for a single long call', async t => {
+  const stub = await startStub([0]);
+  t.after(() => stub.close());
+  const client = makeClient(stub.url, { timeoutMs: 5000, maxRetries: 0 });
+  const started = Date.now();
+  await assert.rejects(
+    () => client.chat([{ role: 'user', content: 'hi' }], { timeoutMs: 150 }),
+    /timeout/i
+  );
+  assert.ok(Date.now() - started < 1500, 'per-call timeoutMs must win over the client default');
+});
+
 test('error description never leaks the API key', async t => {
   const stub = await startStub([503]);
   t.after(() => stub.close());

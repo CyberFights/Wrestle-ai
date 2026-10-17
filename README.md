@@ -38,7 +38,8 @@ Optional:
   field can still override the server default for that response.
 - `PROFILE_CONTEXT_CHAR_LIMIT` — how many characters of source documents are sent to the
   model when building a personality profile (default `24000`).
-- `PROFILE_MAX_TOKENS` — model reply token cap for `POST /personality_profile` (default `4000`).
+- `PROFILE_MAX_TOKENS` — model reply token cap for `POST /personality_profile` (default `8000`).
+  Cut-off JSON is repaired when possible; a compact retry runs if the first reply still cannot be parsed.
 - `PROFILE_MISTRAL_TIMEOUT_MS` — per-attempt Mistral timeout for profile/memory extraction
   (default `120000`). Battle and casual chat still use `MISTRAL_TIMEOUT_MS`.
 - `PROFILE_MEMORY_CHUNKS` — max document chunks sent through the second memory-extraction

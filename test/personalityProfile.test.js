@@ -45,6 +45,18 @@ test('parseJsonFromModel pulls the object out of extra prose', () => {
   assert.equal(parsed.person_name, 'Nia');
 });
 
+test('parseJsonFromModel repairs JSON cut off mid-string', () => {
+  const parsed = parseJsonFromModel('{"person_name":"Greg","summary":"A careful writer who');
+  assert.equal(parsed.person_name, 'Greg');
+  assert.match(parsed.summary, /careful writer/);
+});
+
+test('parseJsonFromModel repairs JSON cut off after a nested object', () => {
+  const parsed = parseJsonFromModel('{"person_name":"Ada","attachment":{"style":"Secure","evidence":"stayed"');
+  assert.equal(parsed.person_name, 'Ada');
+  assert.equal(parsed.attachment.style, 'Secure');
+});
+
 test('normalizeProfile coerces strings and marks indicators as not diagnoses', () => {
   const profile = normalizeProfile({
     person_name: 'Sam',

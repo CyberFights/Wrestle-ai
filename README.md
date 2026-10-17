@@ -34,6 +34,15 @@ Optional:
 - `RESPONSE_HUMANIZER_ENABLED` — enable the built-in, local response humanizer (default `true`).
   Set to `false` to return the model wording untouched by default; a request's `humanize`
   field can still override the server default for that response.
+- `PROFILE_CONTEXT_CHAR_LIMIT` — how many characters of source documents are sent to the
+  model when building a personality profile (default `24000`).
+- `PROFILE_MAX_TOKENS` — model reply token cap for `POST /personality_profile` (default `4000`).
+- `PROFILE_UPLOAD_MAX_BYTES` — per-file upload limit for profile documents (default `8388608`).
+- `PROFILE_MEMORY_LIMIT` — max extracted memories stored per person (default `200`).
+- `PROFILE_MEMORY_CHAR_LIMIT` — how many characters of those memories are sent to the model (default `6000`).
+- `PERSONA_CHAT_MAX_TOKENS` — model reply token cap when `/wrestling_chat` uses `person_name` (default `800`).
+- `PROFILE_SOURCE_ARCHIVE_LIMIT` — max characters of original source text kept per person (default `400000`).
+- `PROFILE_REVISION_LIMIT` — how many prior profile snapshots to keep for rollback (default `20`).
 
 ## Mistral API errors
 
@@ -67,6 +76,111 @@ To bypass it for one response, send `humanize: false` (or `humanize: 'false'` fo
 form-encoded request). The `RESPONSE_HUMANIZER_ENABLED=false` environment variable changes
 the default for all requests. On battle responses, humanization occurs before the existing
 move/stamina sanitizer, so the existing `your turn.` and move-limit rules still apply.
+
+## Personality profiles (`POST /personality_profile`)
+
+Upload a journal, letter, transcript, or any text document about a person and the server
+builds a **psychological profile**, extracts **recallable memories**, and writes an
+**AI system prompt** that recreates their voice. Analysis follows the Academic Psychologist
+method (Big Five, attachment theory, Vaillant defenses, CBT distortions, relational models):
+observe evidence first, name the framework and its limits, never reduce a person to a DSM
+code. The profile and memories are stored in that caller's own memory folder
+(`<base>_profiles`), keyed by the person's name — isolated from chat, battle, and UGCW memory.
+
+```js
+await fetch(`${apiUrl}/personality_profile`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    user_id: userId,
+    person_name: 'Mara Quinn',
+    document: journalText          // or `text` / `journal`
+    // replace: true               // optional; default merges into an existing profile
+  })
+});
+```
+
+Multipart uploads work too (`files`, `file`, or `document`). Supported types: `txt`, `md`,
+`json`, `html`, `csv`, `rtf`, `pdf`, `docx`. Images and audio are rejected unless you also
+send a `transcript` (OCR or audio transcript). Omit `consent` to proceed; `consent: false`
+returns 400. A `privacy_notice` is included on profile responses.
+
+What comes back:
+
+```jsonc
+{
+  "person_name": "Mara Quinn",
+  "person_key": "mara_quinn",
+  "profile": {
+    "summary": "…",
+    "frameworks_used": [{ "name": "Big Five", "limitations": "…" }],
+    "big_five": { "extraversion": { "level": "Low", "manifestation": "writes instead of calling" } },
+    "attachment": { "style": "Dismissive-Avoidant", "triggered_by": "being needed" },
+    "defense_mechanisms": { "primary": [{ "label": "intellectualization" }], "under_stress": [] },
+    "core_wound": { "label": "…" },
+    "coping_strategy": { "adaptive": "…", "maladaptive": "…" },
+    "blind_spot": { "label": "…" },
+    "cognitive_distortions": [],
+    "personality_traits": [{ "trait": "guarded", "evidence": "…", "confidence": "high" }],
+    "characteristics": [],
+    "mindsets": [],
+    "psychological_indicators": [{ "label": "…", "not_a_diagnosis": true }],
+    "speech_patterns": { "tone": "dry", "catchphrases": [], "example_lines": [] },
+    "ideologies": [],
+    "values": [],
+    "fears": [],
+    "motivations": [],
+    "relationships": [{ "name": "Dad", "model": "Attachment", "unspoken_contract": "…" }],
+    "memories": [{
+      "type": "event",
+      "title": "Dad stopped calling",
+      "content": "He stopped calling after the funeral.",
+      "who": ["Dad"],
+      "importance": "high",
+      "evidence": "…"
+    }],
+    "disclaimer": "Inferred from the supplied documents for persona recreation only. …"
+  },
+  "memories": [ /* same list, also stored at the top level for the AI to reference */ ],
+  "system_prompt": "You are Mara Quinn. Stay in character…",
+  "sources": [{ "filename": "journal.txt", "charCount": 1200, "excerpt": "…" }],
+  "meta": { "memory_folder": "profiles", "merged": false, "memory_count": 1 }
+}
+```
+
+`psychological_indicators` are **inferred from the text for persona recreation only** — not
+a clinical diagnosis or medical advice. Traits are not diagnoses.
+
+Memories are concrete events, people, places, quotes, and habits taken from the documents
+(profile pass, then a second memory-extraction pass over document chunks). They are saved
+with the profile, given ids, and retrieved by the current chat message so the model can
+*reference a past it actually has* instead of inventing one. Contradictory sources are
+kept as disputed rather than silently overwritten. Later uploads merge new memories with
+existing ones (`replace: true` starts over). Full source text is archived (capped).
+`PATCH` / `DELETE /personality_profile` edit or remove a profile; `PATCH` /
+`DELETE /personality_profile/memory` edit one memory; `POST /personality_profile/restore`
+rolls back a revision.
+
+Speak as that person on chat:
+
+```js
+await fetch(`${apiUrl}/wrestling_chat`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    user_id: userId,
+    person_name: 'Mara Quinn',   // loads system_prompt + retrieved memories
+    message: 'What happened with your dad?'
+    // humanize: true            // persona replies are not humanized unless you ask
+    // learn_from_chat: true     // optional: extract new memories from this conversation
+    // system_p: extraInstructions // merged with the persona prompt; does not replace it
+  })
+});
+```
+
+Or pass `system_p` yourself from the saved `system_prompt`. Read a saved profile with
+`GET /personality_profile?user_id=…&person_name=…` (includes `memories`). List everyone
+stored for a caller with `GET /personality_profiles?user_id=…`.
 
 ## Troubleshooting common logs
 
@@ -160,6 +274,7 @@ stops a `/wrestling_chat` reply from sounding like the `/wrestling_bot` battle p
 ├── memory_r_12345_facts         ← character facts via POST /wrestling_chat
 ├── memory_r_12345_chats_battle  ← chat messages via POST /wrestling_bot
 ├── memory_r_12345_facts_battle  ← character facts via POST /wrestling_bot
+├── memory_r_12345_profiles      ← psychological profiles keyed by person name
 ├── memory_r_67890_chats
 ├── memory_r_67890_facts
 └── …
@@ -167,9 +282,9 @@ stops a `/wrestling_chat` reply from sounding like the `/wrestling_bot` battle p
 
 Folder names are derived from the user id (`memory_r_<user_id>` for ids made of letters,
 digits, `-` and `_`; `memory_b_<base64url>` or `memory_h_<sha256>` for anything else), with
-`_chats` / `_facts` (chat scope) or `_chats_battle` / `_facts_battle` (battle scope)
-appended to pick the folder, so they are always unique per user and always valid in
-MongoDB. A new user's folders are created automatically the first time anything is stored
+`_chats` / `_facts` (chat scope), `_chats_battle` / `_facts_battle` (battle scope), or
+`_profiles` (one document per person name) appended to pick the folder, so they are always
+unique per user and always valid in MongoDB. A new user's folders are created automatically the first time anything is stored
 or read for them.
 
 Each folder holds **one memory file** — a single document keyed by the user id:

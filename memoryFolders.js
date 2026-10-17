@@ -25,6 +25,7 @@
  *   <base>_chats_battle     chat messages sent through /wrestling_bot
  *   <base>_facts            character facts learned through /wrestling_chat
  *   <base>_facts_battle     character facts learned through /wrestling_bot
+ *   <base>_profiles         psychological profiles keyed by person name
  *
  * The un-suffixed ("chat") folders keep their original names so existing
  * chat-scoped data is preserved as-is. The battle folders append `_battle`.
@@ -43,6 +44,7 @@ const crypto = require('crypto');
 const FOLDER_PREFIX = 'memory';
 const CHAT_FOLDER_SUFFIX = '_chats';
 const FACTS_FOLDER_SUFFIX = '_facts';
+const PROFILES_FOLDER_SUFFIX = '_profiles';
 
 // The two endpoint scopes. 'chat' folders keep the original names (no extra
 // suffix); 'battle' folders append BATTLE_SCOPE_SUFFIX.
@@ -51,6 +53,7 @@ const BATTLE_SCOPE = 'battle';
 const UGCW_SCOPE = 'ugcw';
 const BATTLE_SCOPE_SUFFIX = '_battle';
 const UGCW_SCOPE_SUFFIX = '_ugcw';
+const PERSONA_SCOPE_PREFIX = 'persona:';
 
 // MongoDB collection names max out at 120 bytes; the base name must stay
 // short enough that the longest typed folder name (base + "_chats_battle" or
@@ -79,9 +82,22 @@ function collectionNameForUser(userId) {
 
 // Only the battle scope adds a suffix; the chat scope keeps the original names
 // so pre-existing chat folders remain valid.
+function isPersonaScope(scope) {
+  return typeof scope === 'string' && scope.startsWith(PERSONA_SCOPE_PREFIX);
+}
+
+function personaScopeFor(personName) {
+  return PERSONA_SCOPE_PREFIX + personKeyForName(personName);
+}
+
 function scopeSuffix(scope) {
   if (scope === BATTLE_SCOPE) return BATTLE_SCOPE_SUFFIX;
   if (scope === UGCW_SCOPE) return UGCW_SCOPE_SUFFIX;
+  if (isPersonaScope(scope)) {
+    const key = personKeyForName(scope.slice(PERSONA_SCOPE_PREFIX.length));
+    const short = crypto.createHash('sha256').update(key).digest('hex').slice(0, 8);
+    return `_p_${short}`;
+  }
   return '';
 }
 
@@ -93,6 +109,25 @@ function chatFolderNameForUser(userId, scope = CHAT_SCOPE) {
 // The user's character facts folder:  <base>_facts[_battle]
 function factsFolderNameForUser(userId, scope = CHAT_SCOPE) {
   return collectionNameForUser(userId) + FACTS_FOLDER_SUFFIX + scopeSuffix(scope);
+}
+
+// The user's psychological-profile folder:  <base>_profiles
+// One collection per caller; each document is one person they have profiled.
+function profilesFolderNameForUser(userId) {
+  return collectionNameForUser(userId) + PROFILES_FOLDER_SUFFIX;
+}
+
+function personKeyForName(name) {
+  const slug = String(name || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  if (slug) return slug.slice(0, 80);
+  const hash = crypto.createHash('sha256').update(String(name || '')).digest('hex').slice(0, 32);
+  return `p_${hash}`;
 }
 
 // True when `name` looks like one of our per-user memory folders — either a
@@ -110,7 +145,8 @@ function isChatFolderName(name) {
   return isUserFolderName(name) &&
     (name.endsWith(CHAT_FOLDER_SUFFIX) ||
       name.endsWith(CHAT_FOLDER_SUFFIX + BATTLE_SCOPE_SUFFIX) ||
-      name.endsWith(CHAT_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX));
+      name.endsWith(CHAT_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX) ||
+      /_chats_p_[a-z0-9_]+$/.test(name));
 }
 
 // True for character facts folders of either scope (<base>_facts or
@@ -122,20 +158,31 @@ function isFactsFolderName(name) {
       name.endsWith(FACTS_FOLDER_SUFFIX + UGCW_SCOPE_SUFFIX));
 }
 
+function isProfilesFolderName(name) {
+  return isUserFolderName(name) && name.endsWith(PROFILES_FOLDER_SUFFIX);
+}
+
 module.exports = {
   FOLDER_PREFIX,
   CHAT_FOLDER_SUFFIX,
   FACTS_FOLDER_SUFFIX,
+  PROFILES_FOLDER_SUFFIX,
   CHAT_SCOPE,
   BATTLE_SCOPE,
   UGCW_SCOPE,
   BATTLE_SCOPE_SUFFIX,
   UGCW_SCOPE_SUFFIX,
+  PERSONA_SCOPE_PREFIX,
+  isPersonaScope,
+  personaScopeFor,
   scopeSuffix,
   collectionNameForUser,
   chatFolderNameForUser,
   factsFolderNameForUser,
+  profilesFolderNameForUser,
+  personKeyForName,
   isUserFolderName,
   isChatFolderName,
-  isFactsFolderName
+  isFactsFolderName,
+  isProfilesFolderName
 };

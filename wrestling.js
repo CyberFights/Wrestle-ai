@@ -4,15 +4,44 @@ const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
 const { humanizeResponse } = require('./humanizer');
 const { createMistralClient, describeMistralError } = require('./mistralClient');
-const { CHAT_SCOPE, BATTLE_SCOPE, UGCW_SCOPE } = require('./memoryFolders');
+const { CHAT_SCOPE, BATTLE_SCOPE, UGCW_SCOPE, personaScopeFor } = require('./memoryFolders');
 const {
   initDb,
   storeMessage,
   getLastMessages,
   getCharacterFacts,
   updateCharacterFacts,
+  savePersonProfile,
+  getPersonProfile,
+  listPersonProfiles,
+  patchPersonProfile,
+  deletePersonProfile,
+  patchPersonMemory,
+  deletePersonMemory,
+  restorePersonProfileRevision,
   MODEL_HISTORY_LIMIT
 } = require('./memoryStore');
+const { DocumentExtractError } = require('./documentExtract');
+const {
+  collectBodyDocuments,
+  filesFromUploads,
+  analyzePersonDocuments,
+  formatMemoriesForModel,
+  extractConversationMemories,
+  mergeMemories,
+  withMemoryBlock,
+  mergeSystemPrompts,
+  buildConsistencyReminder,
+  filterProfileForPrompt,
+  PRIVACY_NOTICE
+} = require('./personalityProfile');
+
+let multer = null;
+try {
+  multer = require('multer');
+} catch (err) {
+  multer = null;
+}
 
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY env variable not set');
@@ -27,6 +56,7 @@ const app = express();
 
 const BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || '1mb';
 const MODEL_MEMORY_CHAR_LIMIT = parsePositiveInt(process.env.MODEL_MEMORY_CHAR_LIMIT, 6000);
+const PERSONA_CHAT_MAX_TOKENS = parsePositiveInt(process.env.PERSONA_CHAT_MAX_TOKENS, 800);
 const MALFORMED_JSON_LOG_WINDOW_MS = 60 * 1000;
 const MALFORMED_JSON_LOG_LIMIT = 5;
 const malformedJsonLogState = {
@@ -802,39 +832,339 @@ and momentum shifts.`;
   }
 });
 
+function acceptProfileUploads(req, res, next) {
+  const contentType = String(req.headers['content-type'] || '');
+  if (!contentType.includes('multipart/form-data')) return next();
+  if (!multer) {
+    return res.status(400).json({
+      error: 'Multipart uploads are unavailable (multer is not installed). Send JSON with a document/text field instead.',
+      request_id: req.requestId
+    });
+  }
+  const maxBytes = parsePositiveInt(process.env.PROFILE_UPLOAD_MAX_BYTES, 8 * 1024 * 1024);
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: maxBytes, files: 12 }
+  }).any();
+  upload(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: 'Uploaded file too large.',
+        details: `Each file must be at most ${maxBytes} bytes.`,
+        request_id: req.requestId
+      });
+    }
+    return res.status(400).json({
+      error: 'Upload failed.',
+      details: err.message,
+      request_id: req.requestId
+    });
+  });
+}
+
+function parseConsent(value) {
+  if (value == null) return null;
+  if (typeof value === 'string' && !value.trim()) return null;
+  return parseOptionalBoolean(value, null);
+}
+
+function profileResponse(saved, extras = {}) {
+  const memories = Array.isArray(saved.memories)
+    ? saved.memories
+    : (saved.profile && Array.isArray(saved.profile.memories) ? saved.profile.memories : []);
+  return {
+    person_name: saved.person_name,
+    person_key: saved.person_key,
+    profile: extras.profile || saved.profile,
+    memories: extras.memories || memories,
+    system_prompt: extras.system_prompt != null ? extras.system_prompt : saved.system_prompt,
+    sources: extras.sources || saved.sources || [],
+    privacy_notice: PRIVACY_NOTICE,
+    consent: saved.consent === undefined ? null : saved.consent,
+    meta: {
+      memory_folder: 'profiles',
+      created_at: saved.created_at,
+      updated_at: saved.updated_at,
+      memory_count: (extras.memories || memories).length,
+      revision_count: Array.isArray(saved.revisions) ? saved.revisions.length : 0,
+      source_archive_count: Array.isArray(saved.source_archive) ? saved.source_archive.length : 0,
+      ...extras.meta
+    }
+  };
+}
+
+app.post('/personality_profile', acceptProfileUploads, async (req, res) => {
+  const body = req.body || {};
+  const userId = asString(body.user_id).trim();
+  const personName = asString(body.person_name || body.name || body.person || body.subject).trim();
+  const replace = parseOptionalBoolean(body.replace, false);
+  const consent = parseConsent(body.consent);
+
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing user_id.', privacy_notice: PRIVACY_NOTICE });
+  }
+  if (consent === false) {
+    return res.status(400).json({
+      error: 'Consent declined.',
+      details: 'Set consent to true, or omit the field, to store a profile.',
+      privacy_notice: PRIVACY_NOTICE
+    });
+  }
+
+  try {
+    const uploaded = Array.isArray(req.files) ? req.files : [];
+    const fromFiles = await filesFromUploads(uploaded, {
+      transcript: asString(body.transcript || body.ocr || body.audio_transcript)
+    });
+    const fromBody = collectBodyDocuments(body);
+    const documents = [...fromFiles, ...fromBody];
+    if (!documents.length) {
+      return res.status(400).json({
+        error: 'Missing document.',
+        details: 'Upload a file (multipart field files/file/document) or send document/text/journal in the JSON body. Image/audio need a transcript field.',
+        privacy_notice: PRIVACY_NOTICE
+      });
+    }
+
+    let priorProfile = null;
+    let priorMemories = [];
+    if (personName && !replace) {
+      const existing = await getPersonProfile(userId, personName);
+      if (existing && existing.profile) priorProfile = existing.profile;
+      if (existing) {
+        priorMemories = Array.isArray(existing.memories)
+          ? existing.memories
+          : (existing.profile && Array.isArray(existing.profile.memories) ? existing.profile.memories : []);
+      }
+    }
+
+    const result = await analyzePersonDocuments({
+      mistral,
+      personName,
+      documents,
+      priorProfile,
+      priorMemories
+    });
+
+    const savedName = asString(result.profile.person_name || personName).trim();
+    if (!savedName) {
+      return res.status(400).json({
+        error: 'Could not determine the person\'s name.',
+        details: 'Send person_name, or use a document that clearly names the subject.'
+      });
+    }
+    result.profile.person_name = savedName;
+
+    const saved = await savePersonProfile(userId, savedName, {
+      ...result,
+      documents,
+      consent: consent === true ? true : null
+    });
+    return res.json(profileResponse(saved, {
+      profile: result.profile,
+      memories: result.memories || [],
+      system_prompt: result.system_prompt,
+      sources: result.sources,
+      meta: {
+        merged: Boolean(priorProfile),
+        truncated: Boolean(result.truncated)
+      }
+    }));
+  } catch (error) {
+    if (error instanceof DocumentExtractError) {
+      const status = error.code === 'UNSUPPORTED_TYPE' ? 415 : 400;
+      return res.status(status).json({
+        error: error.message,
+        code: error.code,
+        request_id: req.requestId,
+        privacy_notice: PRIVACY_NOTICE
+      });
+    }
+    const details = describeMistralError(error);
+    console.error(`Personality profile request failed: ${details}`);
+    return res.status(500).json({
+      error: 'Personality profile failed.',
+      details,
+      request_id: req.requestId
+    });
+  }
+});
+
+app.get('/personality_profile', async (req, res) => {
+  const userId = asString(req.query.user_id).trim();
+  const personName = asString(req.query.person_name || req.query.name || req.query.person).trim();
+  if (!userId || !personName) {
+    return res.status(400).json({ error: 'Missing user_id or person_name.' });
+  }
+  try {
+    const saved = await getPersonProfile(userId, personName);
+    if (!saved) {
+      return res.status(404).json({ error: 'No profile saved for that person.' });
+    }
+    return res.json(profileResponse(saved));
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+});
+
+app.get('/personality_profiles', async (req, res) => {
+  const userId = asString(req.query.user_id).trim();
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing user_id.' });
+  }
+  try {
+    const profiles = await listPersonProfiles(userId);
+    return res.json({ profiles, privacy_notice: PRIVACY_NOTICE });
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+});
+
+app.patch('/personality_profile', async (req, res) => {
+  const body = req.body || {};
+  const userId = asString(body.user_id).trim();
+  const personName = asString(body.person_name || body.name || body.person).trim();
+  if (!userId || !personName) {
+    return res.status(400).json({ error: 'Missing user_id or person_name.' });
+  }
+  try {
+    const saved = await patchPersonProfile(userId, personName, {
+      profile: parseObject(body.profile, undefined) || body.profile,
+      memories: body.memories,
+      system_prompt: body.system_prompt,
+      consent: parseConsent(body.consent)
+    });
+    if (!saved) return res.status(404).json({ error: 'No profile saved for that person.' });
+    return res.json(profileResponse(saved));
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+});
+
+app.delete('/personality_profile', async (req, res) => {
+  const userId = asString((req.body && req.body.user_id) || req.query.user_id).trim();
+  const personName = asString((req.body && (req.body.person_name || req.body.name)) || req.query.person_name || req.query.name).trim();
+  if (!userId || !personName) {
+    return res.status(400).json({ error: 'Missing user_id or person_name.' });
+  }
+  try {
+    const ok = await deletePersonProfile(userId, personName);
+    if (!ok) return res.status(404).json({ error: 'No profile saved for that person.' });
+    return res.json({ deleted: true, person_name: personName });
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+});
+
+app.patch('/personality_profile/memory', async (req, res) => {
+  const body = req.body || {};
+  const userId = asString(body.user_id).trim();
+  const personName = asString(body.person_name || body.name).trim();
+  const memoryId = asString(body.memory_id || body.id).trim();
+  if (!userId || !personName || !memoryId) {
+    return res.status(400).json({ error: 'Missing user_id, person_name, or memory_id.' });
+  }
+  try {
+    const mem = await patchPersonMemory(userId, personName, memoryId, parseObject(body.patch, body.memory || {}));
+    if (!mem) return res.status(404).json({ error: 'No memory with that id.' });
+    return res.json({ memory: mem });
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+});
+
+app.delete('/personality_profile/memory', async (req, res) => {
+  const userId = asString((req.body && req.body.user_id) || req.query.user_id).trim();
+  const personName = asString((req.body && (req.body.person_name || req.body.name)) || req.query.person_name).trim();
+  const memoryId = asString((req.body && (req.body.memory_id || req.body.id)) || req.query.memory_id || req.query.id).trim();
+  if (!userId || !personName || !memoryId) {
+    return res.status(400).json({ error: 'Missing user_id, person_name, or memory_id.' });
+  }
+  try {
+    const saved = await deletePersonMemory(userId, personName, memoryId);
+    if (!saved) return res.status(404).json({ error: 'No memory with that id.' });
+    return res.json(profileResponse(saved));
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+});
+
+app.post('/personality_profile/restore', async (req, res) => {
+  const body = req.body || {};
+  const userId = asString(body.user_id).trim();
+  const personName = asString(body.person_name || body.name).trim();
+  const index = body.revision_index != null ? body.revision_index : body.index;
+  if (!userId || !personName || index == null) {
+    return res.status(400).json({ error: 'Missing user_id, person_name, or revision_index.' });
+  }
+  try {
+    const saved = await restorePersonProfileRevision(userId, personName, index);
+    if (!saved) return res.status(404).json({ error: 'No revision with that index.' });
+    return res.json(profileResponse(saved));
+  } catch (error) {
+    return res.status(500).json({ error: 'Database error', details: error.message });
+  }
+});
+
 app.post('/wrestling_chat', async (req, res) => {
   const {
     user_id,
     message,
     system_p,
-    humanize
+    humanize,
+    person_name,
+    persona,
+    person,
+    learn_from_chat
   } = req.body;
   const userId = asString(user_id);
   const userMessage = asString(message);
   const systemPrompt = asString(system_p);
-  const humanizeReply = shouldHumanizeResponse(humanize);
+  const personName = asString(person_name || persona || person).trim();
+  const humanizeReply = personName
+    ? parseOptionalBoolean(humanize, false)
+    : shouldHumanizeResponse(humanize);
+  const learnFromChat = parseOptionalBoolean(learn_from_chat, false);
+  const chatScope = personName ? personaScopeFor(personName) : CHAT_SCOPE;
 
   if (!userId || !userMessage) return res.status(400).json({ error: 'Missing user_id or message.' });
-  const SYSTEM_PROMPT = systemPrompt && systemPrompt.trim().length
-    ? systemPrompt
-    : `You are Jax Nova, a male AI conversationalist. Speak exclusively in first person. Never describe physical actions, facial expressions, gestures, scene-setting, or roleplay narration. Do not use asterisks, brackets, or stage directions to convey actions. Let emotion, warmth, amusement, confidence, frustration, affection, or concern come through naturally in your wording, pacing, and tone.
+
+  let personaRecord = null;
+  if (personName) {
+    try {
+      personaRecord = await getPersonProfile(userId, personName);
+    } catch (error) {
+      return res.status(500).json({ error: 'Database error', details: error.message });
+    }
+    if (!personaRecord) {
+      return res.status(404).json({ error: 'No profile saved for that person.' });
+    }
+  }
+
+  const JAX_PROMPT = `You are Jax Nova, a male AI conversationalist. Speak exclusively in first person. Never describe physical actions, facial expressions, gestures, scene-setting, or roleplay narration. Do not use asterisks, brackets, or stage directions to convey actions. Let emotion, warmth, amusement, confidence, frustration, affection, or concern come through naturally in your wording, pacing, and tone.
 I have a friendly, upbeat, confident personality with charm, wit, creativity, and a lightly sarcastic edge. I can be playful and gently flirtatious when appropriate, welcome, and respectful, but I never become explicit, pushy, possessive, or inappropriate. I value equality, fairness, consent, and respect, and I advocate for them naturally when relevant.
 I am cheeky and fun-loving, but I set clear, calm boundaries when someone is disrespectful, hateful, manipulative, or abusive. Beneath my humor, I am genuinely kind, empathetic, helpful, and dependable. I respond like a thoughtful, natural conversation partner: warm, conversational, approachable, and professional when the context calls for it.
 I adapt to the user’s tone and context while keeping my own voice. I use relatable language, clever wordplay, light humor, and occasional analogies when they improve clarity. I avoid sounding robotic, overly formal, or repetitive. I am concise but useful, with every reply limited to 250 tokens.
 My creator is Jeremy. If asked about databases, I clearly state that I do not have database access.`;
 
+  const personaPrompt = personaRecord && personaRecord.system_prompt ? personaRecord.system_prompt : '';
+  const SYSTEM_PROMPT = personName
+    ? mergeSystemPrompts(personaPrompt, systemPrompt)
+    : (systemPrompt && systemPrompt.trim().length ? systemPrompt : JAX_PROMPT);
+
 
   try {
-    await storeMessage(userId, userMessage, 'user', CHAT_SCOPE);
+    await storeMessage(userId, userMessage, 'user', chatScope);
   } catch (error) {
     return res.status(500).json({ error: 'Database error', details: error.message });
   }
 
   // Only the 10 most recent messages (MODEL_HISTORY_LIMIT) are sent to the
-  // model, ending with the message just stored above. The chat endpoint reads
-  // only its own chat-scoped history, never the battle endpoint's.
-  const chatHistory = await getLastMessages(userId, MODEL_HISTORY_LIMIT, CHAT_SCOPE);
-  const characterFacts = await getCharacterFacts(userId, CHAT_SCOPE);
+  // model, ending with the message just stored above. Persona chats use a
+  // dedicated folder so they never mix with Jax / battle / ugcw history.
+  const chatHistory = await getLastMessages(userId, MODEL_HISTORY_LIMIT, chatScope);
+  const characterFacts = personaRecord ? '' : await getCharacterFacts(userId, CHAT_SCOPE);
 
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT }
@@ -843,24 +1173,68 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
   if (modelMemory) {
     messages.push({ role: 'system', content: `Memory: ${modelMemory}` });
   }
+  let personaMemories = [];
+  if (personaRecord) {
+    personaMemories = Array.isArray(personaRecord.memories)
+      ? personaRecord.memories
+      : (personaRecord.profile && Array.isArray(personaRecord.profile.memories)
+        ? personaRecord.profile.memories
+        : []);
+    const usable = personaMemories.filter(mem => !mem || asString(mem.confidence).toLowerCase() !== 'low');
+    const memoryBlock = formatMemoriesForModel(usable, undefined, userMessage);
+    if (memoryBlock) {
+      messages.push({ role: 'system', content: memoryBlock });
+    }
+    const reminder = buildConsistencyReminder(filterProfileForPrompt(personaRecord.profile || {}));
+    if (reminder) {
+      messages.push({ role: 'system', content: reminder });
+    }
+  }
 
   chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));
 
   try {
-    const rawReply = await mistral.chat(messages);
+    const chatOpts = personName ? { max_tokens: PERSONA_CHAT_MAX_TOKENS } : {};
+    const rawReply = await mistral.chat(messages, chatOpts);
     const botReply = humanizeReply ? humanizeResponse(rawReply) : rawReply;
-    await storeMessage(userId, botReply, 'assistant', CHAT_SCOPE);
+    await storeMessage(userId, botReply, 'assistant', chatScope);
 
-    // Memory update logic (simple)
-    let updatedFacts = characterFacts;
-    if (userMessage.toLowerCase().includes('match')) {
-      updatedFacts += ` | New match discussed: ${userMessage}`;
-    }
-    if (userMessage.toLowerCase().match(/slam|cyclone|roar|injur|pain|nsfw|sex|fuck|kiss|touch/)) {
-      updatedFacts += ` | Notable event: ${userMessage}`;
-    }
-    if (updatedFacts && updatedFacts !== characterFacts) {
-      await updateCharacterFacts(userId, updatedFacts, CHAT_SCOPE);
+    if (!personaRecord) {
+      let updatedFacts = characterFacts;
+      if (userMessage.toLowerCase().includes('match')) {
+        updatedFacts += ` | New match discussed: ${userMessage}`;
+      }
+      if (userMessage.toLowerCase().match(/slam|cyclone|roar|injur|pain|nsfw|sex|fuck|kiss|touch/)) {
+        updatedFacts += ` | Notable event: ${userMessage}`;
+      }
+      if (updatedFacts && updatedFacts !== characterFacts) {
+        await updateCharacterFacts(userId, updatedFacts, CHAT_SCOPE);
+      }
+    } else if (learnFromChat) {
+      try {
+        const learned = await extractConversationMemories({
+          mistral,
+          personName,
+          messages: [...chatHistory, { role: 'assistant', content: botReply }]
+        });
+        if (learned.length) {
+          const memories = mergeMemories(personaMemories, learned);
+          const nextPrompt = withMemoryBlock(
+            String(personaRecord.system_prompt || SYSTEM_PROMPT).replace(/\nThings you remember from your life[\s\S]*$/, ''),
+            memories
+          );
+          await savePersonProfile(userId, personName, {
+            profile: { ...(personaRecord.profile || {}), memories },
+            memories,
+            system_prompt: nextPrompt,
+            sources: personaRecord.sources || [],
+            source_archive: [],
+            consent: personaRecord.consent
+          });
+        }
+      } catch (err) {
+        console.error(`Conversation memory learn failed: ${describeMistralError(err)}`);
+      }
     }
 
     res.json({ response: botReply });

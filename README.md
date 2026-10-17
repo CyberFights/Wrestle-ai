@@ -182,6 +182,9 @@ Or pass `system_p` yourself from the saved `system_prompt`. Read a saved profile
 `GET /personality_profile?user_id=…&person_name=…` (includes `memories`). List everyone
 stored for a caller with `GET /personality_profiles?user_id=…`.
 
+A browser form lives at **`GET /personality`**: drop a document (or paste the text), preview
+what the page can read, then save through `POST /personality_profile`.
+
 ## Troubleshooting common logs
 
 ### `Mistral API attempt 1 of 4 failed ... timeout of 30000ms exceeded`

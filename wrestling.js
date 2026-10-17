@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const path = require('path');
 const express = require('express');
 const bodyParser = require('body-parser');
 const { sanitizeMoveOutput } = require('./moveSanitizer');
@@ -464,6 +465,10 @@ app.get('/', (req, res) => {
   return res.status(500).json({
     error: 'this is a private Ai interface not meant for public use, without the correct key you cannot use it, your ipaddress has been logged'
   });
+});
+
+app.get(['/personality', '/personality.html'], (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'personality.html'));
 });
 
 app.post('/wrestling_bot', async (req, res) => {

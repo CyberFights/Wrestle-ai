@@ -14,6 +14,7 @@ const PORT = 18992;
 const API_KEY = 'profile-test-key';
 
 const profiles = new Map(); // `${userId}|${personKey}` → record
+const chats = new Map(); // userId → [{ role, content }]
 
 function personKey(name) {
   return String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
@@ -22,8 +23,14 @@ function personKey(name) {
 const fakeMemoryStore = {
   MODEL_HISTORY_LIMIT: 10,
   async initDb() {},
-  async storeMessage() {},
-  async getLastMessages() { return []; },
+  async storeMessage(userId, message, role) {
+    const id = String(userId);
+    if (!chats.has(id)) chats.set(id, []);
+    chats.get(id).push({ role, content: message });
+  },
+  async getLastMessages(userId, limit = 10) {
+    return (chats.get(String(userId)) || []).slice(-limit).map(m => ({ ...m }));
+  },
   async getCharacterFacts() { return ''; },
   async updateCharacterFacts() {},
   async savePersonProfile(userId, personName, record) {
@@ -37,6 +44,7 @@ const fakeMemoryStore = {
       person_key: key,
       person_name: String(personName),
       profile: record.profile,
+      memories: record.memories || (record.profile && record.profile.memories) || [],
       system_prompt: record.system_prompt,
       sources: record.sources || [],
       created_at: prev ? prev.created_at : now,
@@ -56,6 +64,7 @@ const fakeMemoryStore = {
           person_name: doc.person_name,
           person_key: doc.person_key,
           summary: doc.profile && doc.profile.summary,
+          memory_count: Array.isArray(doc.memories) ? doc.memories.length : 0,
           created_at: doc.created_at,
           updated_at: doc.updated_at
         });
@@ -85,6 +94,14 @@ let stubReply = JSON.stringify({
   motivations: ['finish the book'],
   relationships: [{ name: 'Dad', nature: 'estranged' }],
   biography_notes: ['grew up by the lake'],
+  memories: [{
+    type: 'event',
+    title: 'Dad stopped calling',
+    content: 'He stopped calling after the funeral.',
+    who: ['Dad'],
+    importance: 'high',
+    evidence: 'I did not tell Dad.'
+  }],
   system_prompt: 'You are Mara Quinn. Stay in character at all times. Speak exclusively in first person as Mara Quinn. Short clauses. Dry tone. You do not ask for help. Loyalty matters more than comfort.'
 });
 
@@ -217,6 +234,10 @@ test('POST /personality_profile analyzes text and saves under the person\'s name
   assert.equal(res.body.profile.psychological_indicators[0].not_a_diagnosis, true);
   assert.match(res.body.system_prompt, /Mara Quinn/);
   assert.equal(res.body.meta.memory_folder, 'profiles');
+  assert.ok(Array.isArray(res.body.memories));
+  assert.equal(res.body.memories[0].title, 'Dad stopped calling');
+  assert.match(res.body.system_prompt, /Things you remember from your life/);
+  assert.equal(res.body.meta.memory_count, 1);
   const analyst = mistralRequests[0].messages.find(m => m.role === 'system').content;
   assert.match(analyst, /You are Psychologist/);
   assert.match(analyst, /Big Five/);
@@ -227,11 +248,27 @@ test('POST /personality_profile analyzes text and saves under the person\'s name
   assert.equal(saved.status, 200);
   assert.equal(saved.body.person_name, 'Mara Quinn');
   assert.match(saved.body.system_prompt, /Mara Quinn/);
+  assert.equal(saved.body.memories[0].title, 'Dad stopped calling');
 
   const listed = await request('GET', '/personality_profiles?user_id=u1');
   assert.equal(listed.status, 200);
   assert.equal(listed.body.profiles.length, 1);
   assert.equal(listed.body.profiles[0].person_key, 'mara_quinn');
+  assert.equal(listed.body.profiles[0].memory_count, 1);
+});
+
+test('POST /wrestling_chat with person_name references saved document memories', async () => {
+  mistralRequests.length = 0;
+  const res = await request('POST', '/wrestling_chat', {
+    user_id: 'u1',
+    person_name: 'Mara Quinn',
+    message: 'What happened with your dad?'
+  });
+  assert.equal(res.status, 200);
+  const sent = mistralRequests[mistralRequests.length - 1];
+  const contents = (sent.messages || []).map(m => m.content).join('\n');
+  assert.match(contents, /Dad stopped calling/);
+  assert.match(contents, /Things you remember from your life/);
 });
 
 test('POST /personality_profile accepts an uploaded text file', async () => {

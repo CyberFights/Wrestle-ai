@@ -20,7 +20,8 @@ const { DocumentExtractError } = require('./documentExtract');
 const {
   collectBodyDocuments,
   filesFromUploads,
-  analyzePersonDocuments
+  analyzePersonDocuments,
+  formatMemoriesForModel
 } = require('./personalityProfile');
 
 let multer = null;
@@ -872,16 +873,23 @@ app.post('/personality_profile', acceptProfileUploads, async (req, res) => {
     }
 
     let priorProfile = null;
+    let priorMemories = [];
     if (personName && !replace) {
       const existing = await getPersonProfile(userId, personName);
       if (existing && existing.profile) priorProfile = existing.profile;
+      if (existing) {
+        priorMemories = Array.isArray(existing.memories)
+          ? existing.memories
+          : (existing.profile && Array.isArray(existing.profile.memories) ? existing.profile.memories : []);
+      }
     }
 
     const result = await analyzePersonDocuments({
       mistral,
       personName,
       documents,
-      priorProfile
+      priorProfile,
+      priorMemories
     });
 
     const savedName = asString(result.profile.person_name || personName).trim();
@@ -898,6 +906,7 @@ app.post('/personality_profile', acceptProfileUploads, async (req, res) => {
       person_name: saved.person_name,
       person_key: saved.person_key,
       profile: result.profile,
+      memories: result.memories || [],
       system_prompt: result.system_prompt,
       sources: result.sources,
       meta: {
@@ -905,7 +914,8 @@ app.post('/personality_profile', acceptProfileUploads, async (req, res) => {
         created_at: saved.created_at,
         updated_at: saved.updated_at,
         merged: Boolean(priorProfile),
-        truncated: Boolean(result.truncated)
+        truncated: Boolean(result.truncated),
+        memory_count: (result.memories || []).length
       }
     });
   } catch (error) {
@@ -938,16 +948,21 @@ app.get('/personality_profile', async (req, res) => {
     if (!saved) {
       return res.status(404).json({ error: 'No profile saved for that person.' });
     }
+    const memories = Array.isArray(saved.memories)
+      ? saved.memories
+      : (saved.profile && Array.isArray(saved.profile.memories) ? saved.profile.memories : []);
     return res.json({
       person_name: saved.person_name,
       person_key: saved.person_key,
       profile: saved.profile,
+      memories,
       system_prompt: saved.system_prompt,
       sources: saved.sources || [],
       meta: {
         memory_folder: 'profiles',
         created_at: saved.created_at,
-        updated_at: saved.updated_at
+        updated_at: saved.updated_at,
+        memory_count: memories.length
       }
     });
   } catch (error) {
@@ -973,21 +988,40 @@ app.post('/wrestling_chat', async (req, res) => {
     user_id,
     message,
     system_p,
-    humanize
+    humanize,
+    person_name,
+    persona,
+    person
   } = req.body;
   const userId = asString(user_id);
   const userMessage = asString(message);
   const systemPrompt = asString(system_p);
   const humanizeReply = shouldHumanizeResponse(humanize);
+  const personName = asString(person_name || persona || person).trim();
 
   if (!userId || !userMessage) return res.status(400).json({ error: 'Missing user_id or message.' });
+
+  let personaRecord = null;
+  if (personName) {
+    try {
+      personaRecord = await getPersonProfile(userId, personName);
+    } catch (error) {
+      return res.status(500).json({ error: 'Database error', details: error.message });
+    }
+    if (!personaRecord) {
+      return res.status(404).json({ error: 'No profile saved for that person.' });
+    }
+  }
+
   const SYSTEM_PROMPT = systemPrompt && systemPrompt.trim().length
     ? systemPrompt
-    : `You are Jax Nova, a male AI conversationalist. Speak exclusively in first person. Never describe physical actions, facial expressions, gestures, scene-setting, or roleplay narration. Do not use asterisks, brackets, or stage directions to convey actions. Let emotion, warmth, amusement, confidence, frustration, affection, or concern come through naturally in your wording, pacing, and tone.
+    : (personaRecord && personaRecord.system_prompt
+      ? personaRecord.system_prompt
+      : `You are Jax Nova, a male AI conversationalist. Speak exclusively in first person. Never describe physical actions, facial expressions, gestures, scene-setting, or roleplay narration. Do not use asterisks, brackets, or stage directions to convey actions. Let emotion, warmth, amusement, confidence, frustration, affection, or concern come through naturally in your wording, pacing, and tone.
 I have a friendly, upbeat, confident personality with charm, wit, creativity, and a lightly sarcastic edge. I can be playful and gently flirtatious when appropriate, welcome, and respectful, but I never become explicit, pushy, possessive, or inappropriate. I value equality, fairness, consent, and respect, and I advocate for them naturally when relevant.
 I am cheeky and fun-loving, but I set clear, calm boundaries when someone is disrespectful, hateful, manipulative, or abusive. Beneath my humor, I am genuinely kind, empathetic, helpful, and dependable. I respond like a thoughtful, natural conversation partner: warm, conversational, approachable, and professional when the context calls for it.
 I adapt to the user’s tone and context while keeping my own voice. I use relatable language, clever wordplay, light humor, and occasional analogies when they improve clarity. I avoid sounding robotic, overly formal, or repetitive. I am concise but useful, with every reply limited to 250 tokens.
-My creator is Jeremy. If asked about databases, I clearly state that I do not have database access.`;
+My creator is Jeremy. If asked about databases, I clearly state that I do not have database access.`);
 
 
   try {
@@ -1008,6 +1042,17 @@ My creator is Jeremy. If asked about databases, I clearly state that I do not ha
   const modelMemory = memoryForModel(characterFacts);
   if (modelMemory) {
     messages.push({ role: 'system', content: `Memory: ${modelMemory}` });
+  }
+  if (personaRecord) {
+    const personaMemories = Array.isArray(personaRecord.memories)
+      ? personaRecord.memories
+      : (personaRecord.profile && Array.isArray(personaRecord.profile.memories)
+        ? personaRecord.profile.memories
+        : []);
+    const memoryBlock = formatMemoriesForModel(personaMemories);
+    if (memoryBlock && !String(SYSTEM_PROMPT).includes('Things you remember from your life')) {
+      messages.push({ role: 'system', content: memoryBlock });
+    }
   }
 
   chatHistory.forEach(msg => messages.push({ role: msg.role, content: msg.content }));

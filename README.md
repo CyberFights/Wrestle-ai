@@ -38,6 +38,8 @@ Optional:
   model when building a personality profile (default `24000`).
 - `PROFILE_MAX_TOKENS` — model reply token cap for `POST /personality_profile` (default `4000`).
 - `PROFILE_UPLOAD_MAX_BYTES` — per-file upload limit for profile documents (default `8388608`).
+- `PROFILE_MEMORY_LIMIT` — max extracted memories stored per person (default `200`).
+- `PROFILE_MEMORY_CHAR_LIMIT` — how many characters of those memories are sent to the model (default `6000`).
 
 ## Mistral API errors
 
@@ -75,12 +77,12 @@ move/stamina sanitizer, so the existing `your turn.` and move-limit rules still 
 ## Personality profiles (`POST /personality_profile`)
 
 Upload a journal, letter, transcript, or any text document about a person and the server
-builds a **psychological profile** plus an **AI system prompt** that recreates their voice.
-Analysis follows the Academic Psychologist method (Big Five, attachment theory, Vaillant
-defenses, CBT distortions, relational models): observe evidence first, name the framework
-and its limits, never reduce a person to a DSM code. The profile is stored in that
-caller's own memory folder (`<base>_profiles`), keyed by the person's name — isolated from
-chat, battle, and UGCW memory.
+builds a **psychological profile**, extracts **recallable memories**, and writes an
+**AI system prompt** that recreates their voice. Analysis follows the Academic Psychologist
+method (Big Five, attachment theory, Vaillant defenses, CBT distortions, relational models):
+observe evidence first, name the framework and its limits, never reduce a person to a DSM
+code. The profile and memories are stored in that caller's own memory folder
+(`<base>_profiles`), keyed by the person's name — isolated from chat, battle, and UGCW memory.
 
 ```js
 await fetch(`${apiUrl}/personality_profile`, {
@@ -124,19 +126,47 @@ What comes back:
     "fears": [],
     "motivations": [],
     "relationships": [{ "name": "Dad", "model": "Attachment", "unspoken_contract": "…" }],
+    "memories": [{
+      "type": "event",
+      "title": "Dad stopped calling",
+      "content": "He stopped calling after the funeral.",
+      "who": ["Dad"],
+      "importance": "high",
+      "evidence": "…"
+    }],
     "disclaimer": "Inferred from the supplied documents for persona recreation only. …"
   },
+  "memories": [ /* same list, also stored at the top level for the AI to reference */ ],
   "system_prompt": "You are Mara Quinn. Stay in character…",
   "sources": [{ "filename": "journal.txt", "charCount": 1200, "excerpt": "…" }],
-  "meta": { "memory_folder": "profiles", "merged": false }
+  "meta": { "memory_folder": "profiles", "merged": false, "memory_count": 1 }
 }
 ```
 
 `psychological_indicators` are **inferred from the text for persona recreation only** — not
-a clinical diagnosis or medical advice. Traits are not diagnoses. Feed `system_prompt` back
-as `system_p` on `/wrestling_chat` (or any chat client) to speak as that person.
+a clinical diagnosis or medical advice. Traits are not diagnoses.
 
-Read a saved profile with `GET /personality_profile?user_id=…&person_name=…`. List everyone
+Memories are concrete events, people, places, quotes, and habits taken from the documents.
+They are saved with the profile and injected when the persona speaks, so the model can
+*reference a past it actually has* instead of inventing one. Later uploads merge new
+memories with existing ones (`replace: true` starts over).
+
+Speak as that person on chat:
+
+```js
+await fetch(`${apiUrl}/wrestling_chat`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    user_id: userId,
+    person_name: 'Mara Quinn',   // loads system_prompt + memories
+    message: 'What happened with your dad?'
+  })
+});
+```
+
+Or pass `system_p` yourself from the saved `system_prompt`. Read a saved profile with
+`GET /personality_profile?user_id=…&person_name=…` (includes `memories`). List everyone
 stored for a caller with `GET /personality_profiles?user_id=…`.
 
 ## Troubleshooting common logs

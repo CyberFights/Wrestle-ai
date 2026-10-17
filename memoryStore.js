@@ -425,12 +425,18 @@ async function savePersonProfile(userId, personName, record) {
   const now = new Date();
   const folder = await ensureProfilesFolder(id);
   const existing = await folder.findOne({ _id: key }, { projection: { created_at: 1 } });
+  const memories = Array.isArray(record && record.memories)
+    ? record.memories
+    : (record && record.profile && Array.isArray(record.profile.memories) ? record.profile.memories : []);
+  const profile = record && record.profile ? record.profile : {};
+  if (!Array.isArray(profile.memories)) profile.memories = memories;
   const doc = {
     _id: key,
     user_id: id,
     person_key: key,
     person_name: name,
-    profile: record && record.profile ? record.profile : {},
+    profile,
+    memories,
     system_prompt: record && record.system_prompt != null ? String(record.system_prompt) : '',
     sources: Array.isArray(record && record.sources) ? record.sources : [],
     updated_at: now
@@ -462,7 +468,7 @@ async function listPersonProfiles(userId) {
   const rows = await folder
     .find(
       { user_id: id },
-      { projection: { person_name: 1, person_key: 1, updated_at: 1, created_at: 1, 'profile.summary': 1 } }
+      { projection: { person_name: 1, person_key: 1, updated_at: 1, created_at: 1, 'profile.summary': 1, memories: 1 } }
     )
     .sort({ updated_at: -1 })
     .toArray();
@@ -470,6 +476,9 @@ async function listPersonProfiles(userId) {
     person_name: row.person_name,
     person_key: row.person_key || row._id,
     summary: row.profile && row.profile.summary ? row.profile.summary : '',
+    memory_count: Array.isArray(row.memories)
+      ? row.memories.length
+      : (row.profile && Array.isArray(row.profile.memories) ? row.profile.memories.length : 0),
     created_at: row.created_at,
     updated_at: row.updated_at
   }));

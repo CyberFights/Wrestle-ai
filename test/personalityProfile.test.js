@@ -6,6 +6,9 @@ const {
   ANALYST_SYSTEM_PROMPT,
   parseJsonFromModel,
   normalizeProfile,
+  normalizeMemories,
+  mergeMemories,
+  formatMemoriesForModel,
   buildSystemPrompt,
   collectBodyDocuments,
   combineSources
@@ -19,6 +22,7 @@ test('analyst prompt uses the academic psychologist method', () => {
   assert.match(ANALYST_SYSTEM_PROMPT, /Never reduce a person to a diagnosis/);
   assert.match(ANALYST_SYSTEM_PROMPT, /People are not their DSM codes/);
   assert.match(ANALYST_SYSTEM_PROMPT, /Observe before diagnosing/);
+  assert.match(ANALYST_SYSTEM_PROMPT, /Extract \*\*memories\*\*/);
 });
 
 test('parseJsonFromModel accepts fenced JSON', () => {
@@ -108,6 +112,52 @@ test('buildSystemPrompt recreates the person in first person', () => {
   assert.match(prompt, /extraversion/);
   assert.match(prompt, /Dismissive-Avoidant/);
   assert.match(prompt, /left behind/);
+});
+
+test('normalizeMemories and mergeMemories keep source-grounded recall items', () => {
+  const memories = normalizeMemories([
+    'grew up by the lake',
+    {
+      type: 'event',
+      title: 'Dad stopped calling',
+      content: 'He stopped calling after the funeral.',
+      when: 'the winter after',
+      who: ['Dad'],
+      importance: 'high',
+      evidence: 'journal week 3'
+    }
+  ]);
+  assert.equal(memories[0].type, 'fact');
+  assert.equal(memories[1].type, 'event');
+  assert.equal(memories[1].who[0], 'Dad');
+
+  const merged = mergeMemories(memories, [
+    { type: 'event', title: 'Dad stopped calling', content: 'He stopped calling after the funeral.' },
+    { type: 'habit', title: 'writes after midnight', content: 'Every entry is timestamped past 12.' }
+  ]);
+  assert.equal(merged.length, 3);
+  assert.equal(merged[0].title, 'Dad stopped calling');
+  assert.equal(merged[1].title, 'writes after midnight');
+  assert.equal(merged[2].title, 'grew up by the lake');
+});
+
+test('formatMemoriesForModel is something the persona can reference', () => {
+  const block = formatMemoriesForModel([
+    { type: 'event', title: 'Dad stopped calling', content: 'He stopped calling after the funeral.', importance: 'high' }
+  ]);
+  assert.match(block, /Things you remember from your life/);
+  assert.match(block, /Dad stopped calling/);
+  assert.match(block, /do not invent extra biographical facts/i);
+});
+
+test('buildSystemPrompt includes extracted memories', () => {
+  const prompt = buildSystemPrompt({
+    person_name: 'Mara Quinn',
+    summary: 'Sharp.',
+    memories: [{ type: 'place', title: 'the lake house', content: 'Summers at the lake house.' }]
+  });
+  assert.match(prompt, /the lake house/);
+  assert.match(prompt, /Things you remember/);
 });
 
 test('collectBodyDocuments reads document, text, and documents[]', () => {

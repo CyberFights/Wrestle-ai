@@ -30,8 +30,9 @@ Optional:
   because a 4000-token profile JSON often needs more than 30 seconds.
 - `MISTRAL_MAX_RETRIES` — how many times a failed Mistral call is retried (default `3`).
   Retries only happen for transient failures — rate limits (429) and server errors
-  (5xx, e.g. the 503 Mistral returns when overloaded), plus timeouts and connection
-  errors — with exponential backoff. Permanent client errors (400/401/…) fail immediately.
+  (5xx, e.g. the 503 Mistral returns when overloaded), timeouts and connection
+  errors, and received-but-empty completions (see "empty or malformed reply" below) —
+  with exponential backoff. Permanent client errors (400/401/…) fail immediately.
 - `REQUEST_BODY_LIMIT` — maximum HTTP request body size accepted by the API (default `1mb`).
 - `RESPONSE_HUMANIZER_ENABLED` — enable the built-in, local response humanizer (default `true`).
   Set to `false` to return the model wording untouched by default; a request's `humanize`
@@ -202,6 +203,30 @@ If this happens often, try increasing `MISTRAL_TIMEOUT_MS`, switching `MISTRAL_M
 faster model, or reducing how much `system_p`/memory text is sent with each request. The
 server already caps model-visible memory with `MODEL_MEMORY_CHAR_LIMIT` so old accumulated
 facts do not make every Mistral call grow forever.
+
+### `Mistral API request failed: unexpected error: Mistral API returned an empty or malformed reply`
+
+The call reached Mistral and got a `200` back, but the completion contained no usable text.
+The client now:
+
+- accepts the non-standard shapes Mistral returns (content as an array of chunks, or a
+  double-encoded JSON body) instead of rejecting them,
+- treats a genuinely empty completion as transient and retries it automatically with the
+  same backoff as 429/5xx responses, and
+- when the reply stays empty through all retries, logs the *shape* of what came back
+  (e.g. `shape=content-missing`, `shape=content-chunks`, `shape=content-string`) and the
+  upstream `finish_reason` so the cause is visible.
+
+Common follow-ups:
+
+- **`finish_reason=length`**: the model ran out of `max_tokens` before producing text.
+  Raise `max_tokens` for that call (the chat client caps replies at 250 by default).
+- **`finish_reason=content_filter`**: the request was refused; the client does not retry
+  these because an identical request will be refused again.
+- **`shape=content-missing` / `finish_reason=stop`**: usually an overloaded platform
+  answering with an empty string. Retries normally absorb this — if you see it in logs
+  persistently, it is upstream; check Mistral's status page and consider a smaller/faster
+  `MISTRAL_MODEL`.
 
 ### `Rejected malformed JSON: POST /wrestling_bot`
 

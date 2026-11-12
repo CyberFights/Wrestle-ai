@@ -15,13 +15,16 @@ const http = require('node:http');
 const {
   createMistralClient,
   describeMistralError,
-  isRetryableMistralError
+  isRetryableMistralError,
+  extractMessageText
 } = require('../mistralClient');
 
 const API_KEY = 'test-secret-key-12345';
 
-// Starts a stub "Mistral API". `script` is a list of HTTP status codes to
-// answer, in order; the 200 answer returns a chat-completion-shaped body.
+// Starts a stub "Mistral API". `script` is a list of answers, in order; each
+// entry is either a status code or { status, body } for a custom 200 payload
+// (body is sent as JSON; pass `bodyRaw` to send a pre-serialized string).
+// A plain 200 answers with a chat-completion-shaped body.
 // Returns { url, requests, close } where `requests` logs every hit.
 function startStub(script) {
   const requests = [];
@@ -30,11 +33,18 @@ function startStub(script) {
     req.on('data', chunk => { raw += chunk; });
     req.on('end', () => {
       requests.push({ authorization: req.headers.authorization, body: JSON.parse(raw || '{}') });
-      const status = script[Math.min(requests.length - 1, script.length - 1)];
+      const entry = script[Math.min(requests.length - 1, script.length - 1)];
+      const status = typeof entry === 'number' ? entry : entry.status;
       if (status === 0) return; // hang forever — used for the timeout test
       res.writeHead(status, { 'Content-Type': 'application/json' });
       if (status === 200) {
-        res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: ' your turn. ' } }] }));
+        if (entry && entry.bodyRaw !== undefined) {
+          res.end(entry.bodyRaw);
+        } else {
+          res.end(JSON.stringify(entry && entry.body !== undefined
+            ? entry.body
+            : { choices: [{ message: { role: 'assistant', content: ' your turn. ' } }] }));
+        }
       } else {
         res.end(JSON.stringify({ message: `stub error ${status}` }));
       }
@@ -140,11 +150,123 @@ test('error description never leaks the API key', async t => {
   assert.ok(description.length < 1000, 'description stays a short summary, not a config dump');
 });
 
+test('accepts content delivered as an array of chunks', async t => {
+  const stub = await startStub([
+    {
+      status: 200,
+      body: {
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: [{ type: 'text', text: 'internal reasoning' }] },
+              { type: 'text', text: 'Your ' },
+              { type: 'text', text: 'turn.' }
+            ]
+          },
+          finish_reason: 'stop'
+        }]
+      }
+    }
+  ]);
+  t.after(() => stub.close());
+
+  const reply = await makeClient(stub.url, { maxRetries: 0 }).chat([{ role: 'user', content: 'hi' }]);
+  assert.equal(reply, 'Your turn.');
+});
+
+test('accepts a double-encoded JSON response body', async t => {
+  const inner = JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'wrapped reply' } }] });
+  const stub = await startStub([{ status: 200, bodyRaw: JSON.stringify(inner) }]);
+  t.after(() => stub.close());
+
+  const reply = await makeClient(stub.url, { maxRetries: 0 }).chat([{ role: 'user', content: 'hi' }]);
+  assert.equal(reply, 'wrapped reply');
+});
+
+test('treats an unparseable string body as empty and retries it', async t => {
+  const stub = await startStub([
+    { status: 200, bodyRaw: '<html>upstream proxy error</html>' },
+    { status: 200, body: { choices: [{ message: { role: 'assistant', content: 'recovered' } }] } }
+  ]);
+  t.after(() => stub.close());
+
+  const reply = await makeClient(stub.url).chat([{ role: 'user', content: 'hi' }]);
+  assert.equal(reply, 'recovered');
+  assert.equal(stub.requests.length, 2, 'a transient garbage 200 body must be retried');
+});
+
+test('retries a transient empty reply and then succeeds', async t => {
+  const stub = await startStub([
+    { status: 200, body: { choices: [{ message: { role: 'assistant', content: '' }, finish_reason: 'stop' }] } },
+    { status: 200, body: { choices: [{ message: { role: 'assistant', content: 'second try' } }] } }
+  ]);
+  t.after(() => stub.close());
+
+  const reply = await makeClient(stub.url).chat([{ role: 'user', content: 'hi' }]);
+  assert.equal(reply, 'second try');
+  assert.equal(stub.requests.length, 2);
+});
+
+test('gives up after all retries on a persistent empty reply and reports why', async t => {
+  const stub = await startStub([
+    { status: 200, body: { choices: [{ message: { role: 'assistant', content: null }, finish_reason: 'length' }] } }
+  ]);
+  t.after(() => stub.close());
+
+  let failure;
+  try {
+    await makeClient(stub.url, { maxRetries: 2 }).chat([{ role: 'user', content: 'hi' }]);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, 'the call should have failed');
+  assert.equal(stub.requests.length, 3, 'initial attempt + 2 retries');
+  assert.equal(failure.isMistralReplyError, true);
+  assert.match(failure.message, /empty or malformed reply/);
+
+  const description = describeMistralError(failure);
+  assert.match(description, /Mistral API returned an empty or malformed reply/);
+  assert.match(description, /shape=content-missing/, 'description should say the content was missing');
+  assert.match(description, /finish_reason=length/, 'description should carry the upstream finish_reason');
+  assert.ok(!description.includes(API_KEY), 'description must not contain the API key');
+});
+
+test('does not retry a content-filter refusal', async t => {
+  const stub = await startStub([
+    { status: 200, body: { choices: [{ message: { role: 'assistant' }, finish_reason: 'content_filter' }] } }
+  ]);
+  t.after(() => stub.close());
+
+  await assert.rejects(
+    () => makeClient(stub.url).chat([{ role: 'user', content: 'hi' }]),
+    error => error.isMistralReplyError === true
+  );
+  assert.equal(stub.requests.length, 1, 'a content filter refusal is deterministic and must not be retried');
+});
+
+test('extractMessageText normalizes the shapes Mistral returns', () => {
+  assert.deepEqual(
+    extractMessageText({ choices: [{ message: { content: ' hello ' } }] }).text,
+    'hello'
+  );
+  assert.deepEqual(
+    extractMessageText({ choices: [{ message: { content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] } }] }).text,
+    'ab'
+  );
+  assert.equal(extractMessageText('not json at all').shape, 'data-string-unparseable');
+  assert.equal(extractMessageText(undefined).shape, 'no-payload');
+  assert.equal(extractMessageText({ choices: [] }).shape, 'content-missing');
+  assert.equal(extractMessageText({ choices: [{ message: { content: 42 } }] }).shape, 'content-number');
+});
+
 test('classifies retryable errors correctly', () => {
   assert.equal(isRetryableMistralError({ isAxiosError: true, response: { status: 503 } }), true);
   assert.equal(isRetryableMistralError({ isAxiosError: true, response: { status: 429 } }), true);
   assert.equal(isRetryableMistralError({ isAxiosError: true, response: { status: 400 } }), false);
   assert.equal(isRetryableMistralError({ isAxiosError: true, response: { status: 401 } }), false);
   assert.equal(isRetryableMistralError({ isAxiosError: true, code: 'ECONNABORTED' }), true, 'timeouts retry');
+  assert.equal(isRetryableMistralError({ isMistralReplyError: true, details: { finishReason: 'length' } }), true, 'empty replies retry');
+  assert.equal(isRetryableMistralError({ isMistralReplyError: true, details: { finishReason: 'content_filter' } }), false, 'content filter refusals do not retry');
   assert.equal(isRetryableMistralError(new TypeError('bug in our code')), false, 'local bugs must not retry');
 });

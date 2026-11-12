@@ -9,7 +9,8 @@
  *      turn forever (axios defaults to `timeout: 0`, i.e. never).
  *   2. Retries with exponential backoff + jitter for transient failures.
  *      Mistral answers with 429 / 5xx (e.g. 503 when the platform is
- *      overloaded), and those almost always succeed when retried shortly.
+ *      overloaded) — and intermittently with empty or chunked-shaped
+ *      completions — which almost always succeed when retried shortly.
  *   3. Error descriptions that NEVER include the request config. Axios error
  *      objects carry `config.headers.Authorization` — the raw API key — so
  *      logging the raw error object leaks the key into the logs. Only
@@ -41,16 +42,91 @@ function sleep(ms) {
 
 // Errors without a response (timeout, connection reset, DNS) are transient;
 // errors with a response are retried only for the statuses above.
+// A received-but-unusable completion (empty content) is also treated as
+// transient — Mistral answers with empty strings/nulls intermittently even
+// for healthy requests — unless it was refused by the content filter, which
+// is deterministic for an identical request.
 function isRetryableMistralError(error) {
+  if (error && error.isMistralReplyError) {
+    return !(error.details && error.details.finishReason === 'content_filter');
+  }
   if (!error || !error.isAxiosError) return false;
   if (!error.response) return true;
   return RETRYABLE_STATUSES.has(error.response.status);
+}
+
+// Extracts the assistant's reply text from a chat-completion payload.
+// Mistral does not always return the documented shape:
+//
+//   1. Plain string content — the documented shape:
+//        { choices: [{ message: { content: "..." } }] }
+//   2. Content as an array of chunks (newer/larger models, multi-part or
+//      reasoning outputs):
+//        { choices: [{ message: { content: [{ type: 'text', text: '...' }] } }] }
+//   3. The whole response delivered as a JSON string (double-encoded body,
+//      e.g. when a proxy or the upstream mangles the Content-Type and axios
+//      cannot auto-parse it):
+//        "{\"choices\":[{\"message\":{\"content\":\"...\"}}]}"
+//
+// Returns { text, finishReason, shape } where `text` is '' when the reply
+// carries no usable text and `shape` names what was found (used in logs so a
+// persistent failure can be diagnosed without dumping the payload).
+function extractMessageText(data) {
+  let payload = data;
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim();
+    if (!trimmed) return { text: '', finishReason: undefined, shape: 'data-string-empty' };
+    try {
+      payload = JSON.parse(trimmed);
+    } catch (err) {
+      return { text: '', finishReason: undefined, shape: 'data-string-unparseable' };
+    }
+  }
+
+  const choice = payload && Array.isArray(payload.choices) ? payload.choices[0] : undefined;
+  const message = choice && choice.message;
+  const content = message ? message.content : undefined;
+  const finishReason = choice && choice.finish_reason ? String(choice.finish_reason) : undefined;
+
+  if (typeof content === 'string') {
+    return { text: content.trim(), finishReason, shape: 'content-string' };
+  }
+  if (Array.isArray(content)) {
+    const text = content
+      .map(part => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part.text === 'string') return part.text;
+        return '';
+      })
+      .join('')
+      .trim();
+    return { text, finishReason, shape: 'content-chunks' };
+  }
+  if (content == null) {
+    return { text: '', finishReason, shape: payload == null ? 'no-payload' : 'content-missing' };
+  }
+  return { text: '', finishReason, shape: `content-${typeof content}` };
+}
+
+// Marks a received-but-unusable completion so the retry logic can treat it
+// as transient and describeMistralError() can report why it was rejected.
+function makeReplyError(message, details = {}) {
+  const error = new Error(message);
+  error.isMistralReplyError = true;
+  error.details = details;
+  return error;
 }
 
 // Human-readable summary of a failed call. Deliberately built field by field
 // so the Authorization header (or any other request header) can never leak
 // into logs or HTTP responses.
 function describeMistralError(error) {
+  if (error && error.isMistralReplyError) {
+    const details = error.details || {};
+    const bits = [`shape=${details.shape || 'unknown'}`];
+    if (details.finishReason) bits.push(`finish_reason=${details.finishReason}`);
+    return `unexpected error: ${error.message} (${bits.join(', ')})`;
+  }
   if (!error || !error.isAxiosError) {
     return `unexpected error: ${error && error.message ? error.message : String(error)}`;
   }
@@ -102,12 +178,15 @@ function createMistralClient(options = {}) {
           }
         });
 
-        const content = response?.data?.choices?.[0]?.message?.content;
-        if (typeof content !== 'string' || !content.trim()) {
-          // Not an axios error — do not retry malformed 200 payloads forever.
-          throw new Error('Mistral API returned an empty or malformed reply');
+        const { text, finishReason, shape } = extractMessageText(response ? response.data : undefined);
+        if (!text) {
+          // Empty/malformed completions happen intermittently on Mistral's
+          // side, so they are retried like transient HTTP failures (unless
+          // the content filter refused the request). The details are kept
+          // on the error so logs can show *why* the reply was rejected.
+          throw makeReplyError('Mistral API returned an empty or malformed reply', { finishReason, shape });
         }
-        return content.trim();
+        return text;
       } catch (error) {
         const retryable = isRetryableMistralError(error);
         if (!retryable || attempt === maxRetries) throw error;
@@ -134,6 +213,7 @@ module.exports = {
   createMistralClient,
   describeMistralError,
   isRetryableMistralError,
+  extractMessageText,
   RETRYABLE_STATUSES,
   DEFAULT_URL,
   DEFAULT_MODEL

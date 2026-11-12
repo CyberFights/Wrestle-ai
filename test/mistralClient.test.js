@@ -245,6 +245,72 @@ test('does not retry a content-filter refusal', async t => {
   assert.equal(stub.requests.length, 1, 'a content filter refusal is deterministic and must not be retried');
 });
 
+test('escalates max_tokens when a reply is cut short by the token limit', async t => {
+  const thinkingOnlyBody = {
+    choices: [{
+      message: { content: [{ type: 'thinking', thinking: [{ type: 'text', text: 'reasoning exhausts the budget' }] }] },
+      finish_reason: 'length'
+    }]
+  };
+  const stub = await startStub([
+    { status: 200, body: thinkingOnlyBody },
+    { status: 200, body: { choices: [{ message: { role: 'assistant', content: 'full reply' }, finish_reason: 'stop' }] } }
+  ]);
+  t.after(() => stub.close());
+
+  const reply = await makeClient(stub.url).chat([{ role: 'user', content: 'hi' }]);
+  assert.equal(reply, 'full reply');
+  assert.equal(stub.requests.length, 2);
+  assert.equal(stub.requests[0].body.max_tokens, 250, 'first attempt uses the default budget');
+  assert.ok(
+    stub.requests[1].body.max_tokens >= 1024,
+    `retry must grow the token budget, got ${stub.requests[1].body.max_tokens}`
+  );
+});
+
+test('reports reasoning_only=true when only thinking chunks were produced', async t => {
+  const stub = await startStub([
+    {
+      status: 200,
+      body: {
+        choices: [{
+          message: { content: [{ type: 'thinking', thinking: [{ type: 'text', text: 'still thinking' }] }] },
+          finish_reason: 'length'
+        }]
+      }
+    }
+  ]);
+  t.after(() => stub.close());
+
+  let failure;
+  try {
+    await makeClient(stub.url, { maxRetries: 0 }).chat([{ role: 'user', content: 'hi' }]);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, 'the call should have failed');
+  const description = describeMistralError(failure);
+  assert.match(description, /shape=content-chunks/);
+  assert.match(description, /finish_reason=length/);
+  assert.match(description, /reasoning_only=true/);
+});
+
+test('does not shrink an explicit max_tokens above the escalation cap', async t => {
+  const stub = await startStub([
+    { status: 200, body: { choices: [{ message: { role: 'assistant', content: null }, finish_reason: 'length' }] } },
+    { status: 200, body: { choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] } }
+  ]);
+  t.after(() => stub.close());
+
+  const reply = await makeClient(stub.url).chat(
+    [{ role: 'user', content: 'hi' }],
+    { max_tokens: 5000 }
+  );
+  assert.equal(reply, 'ok');
+  assert.equal(stub.requests[0].body.max_tokens, 5000);
+  assert.equal(stub.requests[1].body.max_tokens, 5000, 'explicit override above the cap must not be shrunk');
+});
+
 test('extractMessageText normalizes the shapes Mistral returns', () => {
   assert.deepEqual(
     extractMessageText({ choices: [{ message: { content: ' hello ' } }] }).text,
@@ -258,6 +324,12 @@ test('extractMessageText normalizes the shapes Mistral returns', () => {
   assert.equal(extractMessageText(undefined).shape, 'no-payload');
   assert.equal(extractMessageText({ choices: [] }).shape, 'content-missing');
   assert.equal(extractMessageText({ choices: [{ message: { content: 42 } }] }).shape, 'content-number');
+  const thinkingOnly = extractMessageText({
+    choices: [{ message: { content: [{ type: 'thinking', thinking: [{ type: 'text', text: 'hmm' }] }] }, finish_reason: 'length' }]
+  });
+  assert.equal(thinkingOnly.text, '');
+  assert.equal(thinkingOnly.thinkingOnly, true);
+  assert.equal(thinkingOnly.finishReason, 'length');
 });
 
 test('classifies retryable errors correctly', () => {

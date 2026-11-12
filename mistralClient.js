@@ -21,6 +21,10 @@ const axios = require('axios');
 
 const DEFAULT_URL = 'https://api.mistral.ai/v1/chat/completions';
 const DEFAULT_MODEL = 'mistral-large-latest';
+const DEFAULT_MAX_TOKENS = 250;
+// Empty replies cut short by the token limit are retried with a larger budget,
+// capped here (an explicit larger max_tokens override is never shrunk).
+const REPLY_LENGTH_MAX_TOKENS = 4096;
 
 // Statuses worth retrying: rate limiting and transient server-side errors.
 // 4xx client errors (400, 401, 403, 404…) fail every time, so they are not retried.
@@ -92,15 +96,22 @@ function extractMessageText(data) {
     return { text: content.trim(), finishReason, shape: 'content-string' };
   }
   if (Array.isArray(content)) {
+    let sawThinking = false;
     const text = content
       .map(part => {
         if (typeof part === 'string') return part;
+        if (part && (part.type === 'thinking' || Array.isArray(part.thinking))) {
+          sawThinking = true;
+          return '';
+        }
         if (part && typeof part.text === 'string') return part.text;
         return '';
       })
       .join('')
       .trim();
-    return { text, finishReason, shape: 'content-chunks' };
+    // Reasoning models can spend the whole token budget on thinking chunks
+    // and leave nothing for a text chunk — worth flagging in logs.
+    return { text, finishReason, shape: 'content-chunks', thinkingOnly: sawThinking && text === '' };
   }
   if (content == null) {
     return { text: '', finishReason, shape: payload == null ? 'no-payload' : 'content-missing' };
@@ -125,6 +136,7 @@ function describeMistralError(error) {
     const details = error.details || {};
     const bits = [`shape=${details.shape || 'unknown'}`];
     if (details.finishReason) bits.push(`finish_reason=${details.finishReason}`);
+    if (details.thinkingOnly) bits.push('reasoning_only=true');
     return `unexpected error: ${error.message} (${bits.join(', ')})`;
   }
   if (!error || !error.isAxiosError) {
@@ -160,15 +172,22 @@ function createMistralClient(options = {}) {
   // Returns the assistant's reply text. Throws the original (sanitized-with
   // describeMistralError before logging!) error after all retries are spent.
   async function chat(messages, overrides = {}) {
-    const body = {
-      model,
-      messages,
-      max_tokens: overrides.max_tokens ?? 250,
-      temperature: overrides.temperature ?? 0.8
-    };
+    const requestedMaxTokens = overrides.max_tokens ?? DEFAULT_MAX_TOKENS;
+    // Reasoning models can burn the whole default token budget on thinking
+    // chunks; when a reply is cut short by the limit we grow the budget on
+    // retries instead of re-sending the same token-starved request.
+    const lengthCap = Math.max(REPLY_LENGTH_MAX_TOKENS, requestedMaxTokens);
+    let effectiveMaxTokens = requestedMaxTokens;
+    const temperature = overrides.temperature ?? 0.8;
     const requestTimeoutMs = toPositiveInt(overrides.timeoutMs, timeoutMs);
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      const body = {
+        model,
+        messages,
+        max_tokens: effectiveMaxTokens,
+        temperature
+      };
       try {
         const response = await axios.post(url, body, {
           timeout: requestTimeoutMs,
@@ -178,18 +197,25 @@ function createMistralClient(options = {}) {
           }
         });
 
-        const { text, finishReason, shape } = extractMessageText(response ? response.data : undefined);
+        const { text, finishReason, shape, thinkingOnly } = extractMessageText(response ? response.data : undefined);
         if (!text) {
           // Empty/malformed completions happen intermittently on Mistral's
           // side, so they are retried like transient HTTP failures (unless
           // the content filter refused the request). The details are kept
           // on the error so logs can show *why* the reply was rejected.
-          throw makeReplyError('Mistral API returned an empty or malformed reply', { finishReason, shape });
+          throw makeReplyError('Mistral API returned an empty or malformed reply', { finishReason, shape, thinkingOnly });
         }
         return text;
       } catch (error) {
         const retryable = isRetryableMistralError(error);
         if (!retryable || attempt === maxRetries) throw error;
+
+        // If the model hit the token limit before emitting any text (typical
+        // for reasoning models), grow max_tokens for the next attempt;
+        // re-sending the same budget would fail the same way.
+        if (error.isMistralReplyError && error.details && error.details.finishReason === 'length') {
+          effectiveMaxTokens = Math.min(lengthCap, Math.max(effectiveMaxTokens * 4, 1024));
+        }
 
         // Exponential backoff with jitter: ~0.8s, ~1.6s, ~3.2s… capped at maxDelayMs.
         const backoff = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);

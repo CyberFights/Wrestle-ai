@@ -219,8 +219,12 @@ The client now:
 
 Common follow-ups:
 
-- **`finish_reason=length`**: the model ran out of `max_tokens` before producing text.
-  Raise `max_tokens` for that call (the chat client caps replies at 250 by default).
+- **`finish_reason=length`** (especially with `reasoning_only=true`): a reasoning model
+  spent the whole token budget on thinking chunks and emitted no text. The client now
+  handles this by growing `max_tokens` automatically on each retry (at least 1024, then
+  4096 — an explicit larger `max_tokens` override is kept). If it still persists, the
+  model needs more budget or the deployment's `MISTRAL_MODEL` should be switched to a
+  non-reasoning model for short battle/chat replies.
 - **`finish_reason=content_filter`**: the request was refused; the client does not retry
   these because an identical request will be refused again.
 - **`shape=content-missing` / `finish_reason=stop`**: usually an overloaded platform

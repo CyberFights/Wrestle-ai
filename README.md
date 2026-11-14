@@ -25,6 +25,11 @@ Optional:
 - `MODEL_MEMORY_CHAR_LIMIT` — how many characters of the most recent memory facts are sent to
   the model (default `6000`). Full memory remains stored in MongoDB.
 - `MISTRAL_MODEL` — Mistral chat model to use (default `mistral-large-latest`).
+  Must match a model the configured endpoint actually serves when `MISTRAL_API_URL` is set.
+- `MISTRAL_API_URL` — full chat-completions endpoint to POST to (default
+  `https://api.mistral.ai/v1/chat/completions`). Point this at any OpenAI-compatible
+  `/v1/chat/completions` server (self-hosted vLLM/Ollama/LocalAI, a gateway, another
+  provider's compatible endpoint). See "Using a custom backend" below.
 - `MISTRAL_REASONING_EFFORT` — optional. Set to `none` to disable the thinking phase on
   **reasoning models** (`magistral-*-latest`, `mistral-medium-3-5`, `mistral-small-2603`).
   Without it, reasoning models spend their whole `max_tokens` budget (and seconds of
@@ -199,6 +204,42 @@ stored for a caller with `GET /personality_profiles?user_id=…`.
 
 A browser form lives at **`GET /personality`**: drop a document (or paste the text), preview
 what the page can read, then save through `POST /personality_profile`.
+
+## Using a custom backend
+
+The Mistral client is not hard-wired to `api.mistral.ai` — it talks plain HTTP to the URL in
+`MISTRAL_API_URL` with a Mistral/OpenAI-style request body. To point the app at a different
+endpoint (self-hosted or hosted):
+
+```bash
+MISTRAL_API_URL="https://your-host/v1/chat/completions"   # full path, the client POSTs here verbatim
+MISTRAL_API_KEY="your-or-placeholder-key"                 # required — the client refuses to start without one
+MISTRAL_MODEL="the-served-model-name"                     # must match what the endpoint serves
+```
+
+What the endpoint must handle:
+
+- **Request** — `POST` with `Content-Type: application/json`, a `Bearer` Authorization header,
+  and a body of `{ model, messages, max_tokens, temperature }` (plus `reasoning_effort` when
+  `MISTRAL_REASONING_EFFORT` is set). It is non-streaming and uses no tools/function-calling.
+- **Response** — a JSON body with `choices[0].message.content` as either a plain string or an
+  array of `{ type: 'text', text }` chunks (both are normalized — thinking/other chunk types
+  are ignored). `finish_reason` is honored for `length` (empty replies are retried with a
+  growing `max_tokens`, see below) and `content_filter` (not retried).
+- **Auth** — the client always sends `Authorization: Bearer $MISTRAL_API_KEY`, so set a key
+  even for local servers that ignore it (any non-empty placeholder works; keep it out of logs).
+- **Timeouts/retries** — `MISTRAL_TIMEOUT_MS`, `MISTRAL_MAX_RETRIES`, and the 429/5xx/499 retry
+  policy apply exactly as with the hosted API, so pick a model fast enough for the caller's
+  patience (reasoning models are usually too slow for this bot).
+- **Quality notes** — `/personality_profile` depends on the model emitting valid JSON (a
+  repair pass exists, but weak models will produce worse profiles); very small models may also
+  break the wrestling move parser more often. Set `MODEL_MEMORY_CHAR_LIMIT` lower if your
+  endpoint is slow.
+
+Reasons people do this: data residency, cost, latency, or running a model whose content
+policies fit their use case. The choice of backend model — and the licenses and terms that
+come with it — is up to you as the operator; the app treats the endpoint as just another HTTP
+service and applies no content policy of its own beyond what the model does.
 
 ## Troubleshooting common logs
 

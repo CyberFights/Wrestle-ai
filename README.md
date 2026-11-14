@@ -25,6 +25,13 @@ Optional:
 - `MODEL_MEMORY_CHAR_LIMIT` — how many characters of the most recent memory facts are sent to
   the model (default `6000`). Full memory remains stored in MongoDB.
 - `MISTRAL_MODEL` — Mistral chat model to use (default `mistral-large-latest`).
+- `MISTRAL_REASONING_EFFORT` — optional. Set to `none` to disable the thinking phase on
+  **reasoning models** (`magistral-*-latest`, `mistral-medium-3-5`, `mistral-small-2603`).
+  Without it, reasoning models spend their whole `max_tokens` budget (and seconds of
+  wall-clock) on reasoning and return empty replies; see "reasoning_only=true" below.
+  Leave unset for models that reject the parameter (`mistral-large-latest`, `ministral-*`,
+  `codestral`) — they answer with HTTP 400, because only reasoning-capable models accept it.
+  Values `high` (full thinking) / `low` / `max` are also passed through when set.
 - `MISTRAL_TIMEOUT_MS` — per-attempt timeout for Mistral API calls (default `30000`).
   Personality-profile analysis uses `PROFILE_MISTRAL_TIMEOUT_MS` instead (default `120000`)
   because a 4000-token profile JSON often needs more than 30 seconds.
@@ -219,18 +226,44 @@ The client now:
 
 Common follow-ups:
 
-- **`finish_reason=length`** (especially with `reasoning_only=true`): a reasoning model
-  spent the whole token budget on thinking chunks and emitted no text. The client now
-  handles this by growing `max_tokens` automatically on each retry (at least 1024, then
-  4096 — an explicit larger `max_tokens` override is kept). If it still persists, the
-  model needs more budget or the deployment's `MISTRAL_MODEL` should be switched to a
-  non-reasoning model for short battle/chat replies.
+- **`finish_reason=length`** with **`reasoning_only=true`**: a reasoning model
+  spent the whole token budget on thinking chunks and emitted no text. The client
+  grows `max_tokens` automatically on each retry (×4, floor 1024, cap 4096), but if
+  the model still never stops reasoning the only real fix is configuration:
+  **set `MISTRAL_REASONING_EFFORT=none`** (reasoning models only — other models 400)
+  or switch `MISTRAL_MODEL` to a non-reasoning model such as `mistral-large-latest`.
+  Reasoning turns that take tens of seconds also trip reverse-proxy timeouts, so this
+  misconfiguration is the usual root cause of `HTTP 499`-style client-closed errors
+  (see below).
 - **`finish_reason=content_filter`**: the request was refused; the client does not retry
   these because an identical request will be refused again.
 - **`shape=content-missing` / `finish_reason=stop`**: usually an overloaded platform
   answering with an empty string. Retries normally absorb this — if you see it in logs
   persistently, it is upstream; check Mistral's status page and consider a smaller/faster
   `MISTRAL_MODEL`.
+
+### `HTTP 499` / `Mistral HTTP 499: ...` (or an nginx 499 in the edge logs)
+
+499 is not an official HTTP status — it is nginx's "Client Closed Request": whoever called
+(the browser, the caller's HTTP client, or a proxy in front of either side) gave up before
+the response finished. In this app it almost always means the upstream Mistral turn was too
+slow, typically because a **reasoning model** was thinking for tens of seconds per turn while
+the client waited. Retrying with a bigger token budget (below) makes each attempt slower, so
+an all-reasoning reply multiplies the wall-clock and trips the caller's timeout.
+
+Fixes, in order:
+
+1. If `MISTRAL_MODEL` is a reasoning model, **set `MISTRAL_REASONING_EFFORT=none`** — the
+   emptiest-thinking turns also become the fastest.
+2. If you cannot change the reasoning effort, switch `MISTRAL_MODEL` to a non-reasoning
+   model (e.g. `mistral-large-latest`).
+3. Only then, raise `MISTRAL_TIMEOUT_MS` (default 30000) or the caller's own timeout — and
+   check the proxy in front of the deployment for a `proxy_read_timeout` shorter than the
+   slowest allowed Mistral turn.
+4. `MISTRAL_MAX_RETRIES` (default 3) multiplies the worst-case latency when every attempt
+   fails; lowering it to 1–2 caps the user-facing wait while still absorbing blips.
+
+The client treats a `499` response from Mistral itself as retryable (like a transient 5xx).
 
 ### `Rejected malformed JSON: POST /wrestling_bot`
 

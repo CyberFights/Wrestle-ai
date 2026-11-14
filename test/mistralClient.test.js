@@ -332,6 +332,31 @@ test('extractMessageText normalizes the shapes Mistral returns', () => {
   assert.equal(thinkingOnly.finishReason, 'length');
 });
 
+test('sends reasoning_effort only when configured, and honors the per-call override', async t => {
+  const stub = await startStub([200, 200, 200]);
+  t.after(() => stub.close());
+
+  const off = makeClient(stub.url, { reasoningEffort: 'NONE ' });
+  await off.chat([{ role: 'user', content: 'one' }]);
+  await makeClient(stub.url).chat([{ role: 'user', content: 'two' }]);
+  await makeClient(stub.url, { reasoningEffort: 'none' })
+    .chat([{ role: 'user', content: 'three' }], { reasoningEffort: 'high' });
+
+  assert.equal(stub.requests[0].body.reasoning_effort, 'none', 'option is normalized and sent');
+  assert.equal(stub.requests[1].body.reasoning_effort, undefined, 'absent by default (Mistral 400s on it)');
+  assert.equal(stub.requests[2].body.reasoning_effort, 'high', 'per-call override wins');
+});
+
+test('retries a 499 gateway status like a transient failure', async t => {
+  const stub = await startStub([499, 200]);
+  t.after(() => stub.close());
+
+  const reply = await makeClient(stub.url).chat([{ role: 'user', content: 'hi' }]);
+  assert.equal(reply, 'your turn.');
+  assert.equal(stub.requests.length, 2);
+  assert.equal(isRetryableMistralError({ isAxiosError: true, response: { status: 499 } }), true);
+});
+
 test('classifies retryable errors correctly', () => {
   assert.equal(isRetryableMistralError({ isAxiosError: true, response: { status: 503 } }), true);
   assert.equal(isRetryableMistralError({ isAxiosError: true, response: { status: 429 } }), true);

@@ -20,7 +20,7 @@
 const axios = require('axios');
 
 const DEFAULT_URL = 'https://api.mistral.ai/v1/chat/completions';
-const DEFAULT_MODEL = 'mistral-large-latest';
+const DEFAULT_MODEL = 'mistral-large-2512';
 const DEFAULT_MAX_TOKENS = 250;
 // Empty replies cut short by the token limit are retried with a larger budget,
 // capped here (an explicit larger max_tokens override is never shrunk).

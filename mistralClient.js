@@ -27,8 +27,11 @@ const DEFAULT_MAX_TOKENS = 250;
 const REPLY_LENGTH_MAX_TOKENS = 4096;
 
 // Statuses worth retrying: rate limiting and transient server-side errors.
+// 499 is a non-standard gateway status (nginx-style "client/upstream closed
+// the connection", e.g. the upstream cut a slow request) — treat it like a
+// transient 5xx rather than failing immediately.
 // 4xx client errors (400, 401, 403, 404…) fail every time, so they are not retried.
-const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 499, 500, 502, 503, 504]);
 
 function toPositiveInt(value, fallback) {
   const n = parseInt(value, 10);
@@ -157,6 +160,14 @@ function describeMistralError(error) {
   return `Mistral HTTP ${status}: ${String(body).slice(0, 500)}`;
 }
 
+// Normalizes a reasoning_effort override. Mistral reasoning models accept
+// "none" / "high" (some accept "low" / "max"); every other model rejects the
+// parameter outright with HTTP 400, so it is only ever sent when configured.
+function toReasoningEffort(value) {
+  const effort = value == null ? '' : String(value).trim().toLowerCase();
+  return effort || undefined;
+}
+
 function createMistralClient(options = {}) {
   const apiKey = options.apiKey ?? process.env.MISTRAL_API_KEY;
   if (!apiKey) throw new Error('createMistralClient: an apiKey (or MISTRAL_API_KEY env var) is required');
@@ -167,6 +178,12 @@ function createMistralClient(options = {}) {
   const maxRetries = toNonNegativeInt(options.maxRetries ?? process.env.MISTRAL_MAX_RETRIES, 3);
   const baseDelayMs = toPositiveInt(options.baseDelayMs, 800);
   const maxDelayMs = toPositiveInt(options.maxDelayMs, 10000);
+  // Set MISTRAL_REASONING_EFFORT=none to make reasoning models (magistral-*,
+  // mistral-medium-3-5, mistral-small-2603) skip the thinking phase — without
+  // it they can burn the whole token budget (and seconds of wall-clock time)
+  // on reasoning before answering. Leave unset for models that reject the
+  // parameter (mistral-large-latest, codestral, ministral-*): they 400 on it.
+  const reasoningEffort = toReasoningEffort(options.reasoningEffort ?? process.env.MISTRAL_REASONING_EFFORT);
   const logger = options.logger || console;
 
   // Returns the assistant's reply text. Throws the original (sanitized-with
@@ -180,6 +197,7 @@ function createMistralClient(options = {}) {
     let effectiveMaxTokens = requestedMaxTokens;
     const temperature = overrides.temperature ?? 0.8;
     const requestTimeoutMs = toPositiveInt(overrides.timeoutMs, timeoutMs);
+    const effectiveReasoningEffort = toReasoningEffort(overrides.reasoningEffort) ?? reasoningEffort;
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       const body = {
@@ -188,6 +206,7 @@ function createMistralClient(options = {}) {
         max_tokens: effectiveMaxTokens,
         temperature
       };
+      if (effectiveReasoningEffort) body.reasoning_effort = effectiveReasoningEffort;
       try {
         const response = await axios.post(url, body, {
           timeout: requestTimeoutMs,
@@ -220,9 +239,12 @@ function createMistralClient(options = {}) {
         // Exponential backoff with jitter: ~0.8s, ~1.6s, ~3.2s… capped at maxDelayMs.
         const backoff = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
         const delay = backoff + Math.floor(Math.random() * Math.max(1, baseDelayMs / 4));
+        const thinkingHint = error.isMistralReplyError && error.details && error.details.thinkingOnly && !effectiveReasoningEffort
+          ? ' Hint: the model spent the budget on thinking — set MISTRAL_REASONING_EFFORT=none to disable reasoning on reasoning models.'
+          : '';
         logger.warn(
           `Mistral API attempt ${attempt + 1} of ${maxRetries + 1} failed ` +
-          `(${describeMistralError(error)}); retrying in ${delay}ms`
+          `(${describeMistralError(error)}); retrying in ${delay}ms${thinkingHint}`
         );
         await sleep(delay);
       }

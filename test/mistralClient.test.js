@@ -16,7 +16,9 @@ const {
   createMistralClient,
   describeMistralError,
   isRetryableMistralError,
-  extractMessageText
+  extractMessageText,
+  modelCapabilities,
+  DEFAULT_MODEL
 } = require('../mistralClient');
 
 const API_KEY = 'test-secret-key-12345';
@@ -336,15 +338,111 @@ test('sends reasoning_effort only when configured, and honors the per-call overr
   const stub = await startStub([200, 200, 200]);
   t.after(() => stub.close());
 
-  const off = makeClient(stub.url, { reasoningEffort: 'NONE ' });
+  // A reasoning-capable model: the knob is normalized and sent.
+  const off = makeClient(stub.url, { model: 'mistral-small-2603', reasoningEffort: 'NONE ' });
   await off.chat([{ role: 'user', content: 'one' }]);
-  await makeClient(stub.url).chat([{ role: 'user', content: 'two' }]);
-  await makeClient(stub.url, { reasoningEffort: 'none' })
+  await makeClient(stub.url, { model: 'mistral-small-2603' }).chat([{ role: 'user', content: 'two' }]);
+  await makeClient(stub.url, { model: 'mistral-small-2603', reasoningEffort: 'none' })
     .chat([{ role: 'user', content: 'three' }], { reasoningEffort: 'high' });
 
   assert.equal(stub.requests[0].body.reasoning_effort, 'none', 'option is normalized and sent');
-  assert.equal(stub.requests[1].body.reasoning_effort, undefined, 'absent by default (Mistral 400s on it)');
+  assert.equal(stub.requests[1].body.reasoning_effort, undefined, 'absent by default');
   assert.equal(stub.requests[2].body.reasoning_effort, 'high', 'per-call override wins');
+});
+
+test('drops reasoning_effort for mistral-large-2512, which does not accept it', async t => {
+  const stub = await startStub([200, 200, 200]);
+  t.after(() => stub.close());
+  const warnings = [];
+  const logger = { warn: message => warnings.push(message) };
+
+  // Mistral Large 3 is instruct-only: sending the field is a 422, so a
+  // leftover MISTRAL_REASONING_EFFORT must not break the app.
+  const client = makeClient(stub.url, { logger, reasoningEffort: 'none' });
+  assert.equal(client.model, 'mistral-large-2512');
+  await client.chat([{ role: 'user', content: 'one' }]);
+  await client.chat([{ role: 'user', content: 'two' }], { reasoningEffort: 'high' });
+
+  assert.equal(stub.requests[0].body.reasoning_effort, undefined);
+  assert.equal(stub.requests[1].body.reasoning_effort, undefined);
+  assert.equal(warnings.length, 1, 'the ignored knob is warned about exactly once');
+  assert.match(warnings[0], /mistral-large-2512/);
+  assert.match(warnings[0], /422/);
+
+  // Other request fields are still sent as usual.
+  assert.equal(stub.requests[0].body.model, 'mistral-large-2512');
+  assert.equal(stub.requests[0].body.max_tokens, 250);
+  assert.equal(stub.requests[0].body.temperature, 0.8);
+});
+
+test('drops a reasoning_effort value the model does not publish', async t => {
+  const stub = await startStub([200, 200]);
+  t.after(() => stub.close());
+  const warnings = [];
+  const client = makeClient(stub.url, {
+    model: 'mistral-large-4',
+    logger: { warn: message => warnings.push(message) }
+  });
+
+  // Mistral Large 4 takes low/medium/high — `none` is not an accepted value.
+  await client.chat([{ role: 'user', content: 'one' }], { reasoningEffort: 'none' });
+  await client.chat([{ role: 'user', content: 'two' }], { reasoningEffort: 'high' });
+
+  assert.equal(stub.requests[0].body.reasoning_effort, undefined);
+  assert.equal(stub.requests[1].body.reasoning_effort, 'high');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /accepted values are low, medium, high/);
+});
+
+test('passes reasoning_effort through for a custom backend model', async t => {
+  const stub = await startStub([200]);
+  t.after(() => stub.close());
+
+  // Unknown models (custom MISTRAL_API_URL servers, new releases) keep the old
+  // pass-through behavior — the client cannot know their limits.
+  const client = makeClient(stub.url, { model: 'local/llama-3.1-8b', reasoningEffort: 'high' });
+  await client.chat([{ role: 'user', content: 'hi' }]);
+
+  assert.equal(stub.requests[0].body.reasoning_effort, 'high');
+  assert.equal(stub.requests[0].body.model, 'local/llama-3.1-8b');
+});
+
+test('caps max_tokens at the mistral-large-2512 output limit', async t => {
+  const stub = await startStub([
+    { status: 200, body: { choices: [{ message: { content: null }, finish_reason: 'length' }] } },
+    { status: 200, body: { choices: [{ message: { role: 'assistant', content: 'ok' } }] } }
+  ]);
+  t.after(() => stub.close());
+  const warnings = [];
+  const client = makeClient(stub.url, { logger: { warn: message => warnings.push(message) } });
+
+  // Mistral Large 3 has an 8k per-reply output cap: ask for more and the
+  // request is rejected outright, so the client caps it and says so.
+  const reply = await client.chat([{ role: 'user', content: 'hi' }], { max_tokens: 32000 });
+  assert.equal(reply, 'ok');
+  assert.equal(stub.requests[0].body.max_tokens, 8192, 'request is capped at the model limit');
+  assert.ok(stub.requests[1].body.max_tokens <= 8192, 'the length escalation must not exceed the cap');
+  assert.ok(
+    warnings.some(w => /Capping max_tokens 32000 to 8192/.test(w)),
+    'the cap is reported once'
+  );
+});
+
+test('modelCapabilities knows mistral-large-2512 and leaves unknown models alone', () => {
+  assert.deepEqual(modelCapabilities('mistral-large-2512'), {
+    model: 'mistral-large-2512',
+    reasoningEfforts: false,
+    maxOutputTokens: 8192
+  });
+  assert.deepEqual(modelCapabilities(' Mistral-Large-2512 '), modelCapabilities('mistral-large-2512'));
+  assert.equal(modelCapabilities('mistral-small-2603').reasoningEfforts.includes('none'), true);
+  assert.equal(modelCapabilities('mistral-large-4').reasoningEfforts.includes('none'), false);
+  assert.deepEqual(modelCapabilities('some-custom-model'), {
+    model: 'some-custom-model',
+    reasoningEfforts: undefined,
+    maxOutputTokens: undefined
+  });
+  assert.equal(DEFAULT_MODEL, 'mistral-large-2512');
 });
 
 test('retries a 499 gateway status like a transient failure', async t => {

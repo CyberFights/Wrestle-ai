@@ -24,14 +24,18 @@ Optional:
   Only stored history is affected by `MEMORY_CHAT_LIMIT`; the model never sees more than this.
 - `MODEL_MEMORY_CHAR_LIMIT` — how many characters of the most recent memory facts are sent to
   the model (default `6000`). Full memory remains stored in MongoDB.
-- `MISTRAL_MODEL` — Mistral chat model to use (default `mistral-large-latest`).
+- `MISTRAL_MODEL` — Mistral chat model to use (default `mistral-large-2512`, i.e. Mistral
+  Large 3 — see "Model compatibility" below).
 - `MISTRAL_REASONING_EFFORT` — optional. Set to `none` to disable the thinking phase on
-  **reasoning models** (`magistral-*-latest`, `mistral-medium-3-5`, `mistral-small-2603`).
-  Without it, reasoning models spend their whole `max_tokens` budget (and seconds of
-  wall-clock) on reasoning and return empty replies; see "reasoning_only=true" below.
-  Leave unset for models that reject the parameter (`mistral-large-latest`, `ministral-*`,
-  `codestral`) — they answer with HTTP 400, because only reasoning-capable models accept it.
-  Values `high` (full thinking) / `low` / `max` are also passed through when set.
+  **reasoning models** (`mistral-small-2603` / `mistral-small-4`, `mistral-medium-3-5`,
+  `mistral-large-4`). Without it, reasoning models spend their whole `max_tokens` budget
+  (and seconds of wall-clock) on reasoning and return empty replies; see
+  "reasoning_only=true" below. The client only sends the parameter to a model that
+  accepts it, so leaving it set is harmless with the default `mistral-large-2512` (which
+  has no reasoning phase and answers HTTP 422 to the field): the value is dropped with one
+  warning in the logs. Values the model publishes are passed through (`none` / `high`, or
+  `low` / `medium` / `high` on Mistral Large 4); an unpublished value (e.g. `none` on
+  Mistral Large 4) is also dropped with a warning instead of failing the call.
 - `MISTRAL_TIMEOUT_MS` — per-attempt timeout for Mistral API calls (default `30000`).
   Personality-profile analysis uses `PROFILE_MISTRAL_TIMEOUT_MS` instead (default `120000`)
   because a 4000-token profile JSON often needs more than 30 seconds.
@@ -58,6 +62,40 @@ Optional:
 - `PERSONA_CHAT_MAX_TOKENS` — model reply token cap when `/wrestling_chat` uses `person_name` (default `800`).
 - `PROFILE_SOURCE_ARCHIVE_LIMIT` — max characters of original source text kept per person (default `400000`).
 - `PROFILE_REVISION_LIMIT` — how many prior profile snapshots to keep for rollback (default `20`).
+
+## Model compatibility
+
+`mistralClient.js` keeps a small table of what each model accepts, so pointing
+`MISTRAL_MODEL` at another Mistral model cannot turn every turn into a failed request.
+Mistral validates the request body per model and answers **422** for parameters the model
+does not support — a status that is deliberately *not* retried, so a single unsupported
+field would fail every call until the config changed.
+
+The default, **Mistral Large 3** (`mistral-large-2512`):
+
+- is **instruct-only** — there is no thinking phase, and the model does not accept
+  `reasoning_effort`. The client therefore never sends it, even when
+  `MISTRAL_REASONING_EFFORT` is set (it warns once and continues).
+- has a **256k context** and an **8k per-reply output cap**. A larger `max_tokens`
+  (e.g. an explicit override above `PROFILE_MAX_TOKENS`) is capped to the published
+  limit with a warning instead of being rejected. The reply-length escalation that grows
+  `max_tokens` after a `finish_reason=length` reply never exceeds the cap either.
+- was **deprecated by Mistral on 2026-10-31** and is scheduled for retirement on
+  **2027-04-29**; `mistral-large-4` is the replacement. Pinning `mistral-large-2512`
+  keeps today's behaviour (the `-latest` aliases move to the newer model) — switching is
+  a `MISTRAL_MODEL` change only, and `mistral-large-4` takes `reasoning_effort=high`
+  (or `medium` / `low`), which this client passes through.
+
+Other models in the table: `ministral-*`, `codestral*`, `devstral*`, `voxtral*`,
+`open-*`, `magistral-*` and older pinned `mistral-large-*` snapshots are treated as
+instruct-only; `mistral-small-2603` / `mistral-small-4`, `mistral-medium-3-5`,
+`mistral-large-4` / `mistral-large-latest` and `zai-glm-*` are sent their published
+`reasoning_effort` values only.
+
+A model that is **not** in the table — a brand-new release, or whatever sits behind a
+custom `MISTRAL_API_URL` — is sent the request untouched: the client cannot know its
+limits, and `MISTRAL_API_URL` may point at a server that is not Mistral at all. Every
+model added to the table is covered by `test/mistralClient.test.js`.
 
 ## Mistral API errors
 
@@ -230,8 +268,10 @@ Common follow-ups:
   spent the whole token budget on thinking chunks and emitted no text. The client
   grows `max_tokens` automatically on each retry (×4, floor 1024, cap 4096), but if
   the model still never stops reasoning the only real fix is configuration:
-  **set `MISTRAL_REASONING_EFFORT=none`** (reasoning models only — other models 400)
-  or switch `MISTRAL_MODEL` to a non-reasoning model such as `mistral-large-latest`.
+  **set `MISTRAL_REASONING_EFFORT=none`** (reasoning models only — instruct-only
+  models such as `mistral-large-2512` reject the field with HTTP 422, so the client
+  omits it for them) or switch `MISTRAL_MODEL` to a non-reasoning model such as
+  `mistral-large-2512`.
   Reasoning turns that take tens of seconds also trip reverse-proxy timeouts, so this
   misconfiguration is the usual root cause of `HTTP 499`-style client-closed errors
   (see below).
@@ -256,7 +296,7 @@ Fixes, in order:
 1. If `MISTRAL_MODEL` is a reasoning model, **set `MISTRAL_REASONING_EFFORT=none`** — the
    emptiest-thinking turns also become the fastest.
 2. If you cannot change the reasoning effort, switch `MISTRAL_MODEL` to a non-reasoning
-   model (e.g. `mistral-large-latest`).
+   model (e.g. `mistral-large-2512`).
 3. Only then, raise `MISTRAL_TIMEOUT_MS` (default 30000) or the caller's own timeout — and
    check the proxy in front of the deployment for a `proxy_read_timeout` shorter than the
    slowest allowed Mistral turn.

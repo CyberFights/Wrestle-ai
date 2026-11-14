@@ -3,7 +3,7 @@
 /*
  * mistralClient.js — thin wrapper around the Mistral chat-completions API.
  *
- * Adds three things the app needs on top of a raw axios POST:
+ * Adds four things the app needs on top of a raw axios POST:
  *
  *   1. A request timeout — a hung upstream request must not hang a user's
  *      turn forever (axios defaults to `timeout: 0`, i.e. never).
@@ -15,6 +15,12 @@
  *      objects carry `config.headers.Authorization` — the raw API key — so
  *      logging the raw error object leaks the key into the logs. Only
  *      describeMistralError() output should end up in logs or responses.
+ *   4. Model-aware request bodies. Mistral answers 422 (not a retryable
+ *      status) for a request that carries a parameter the target model does
+ *      not accept, so the client only sends what the model supports — see
+ *      MODEL_CAPABILITIES. Default model: Mistral Large 3 (mistral-large-2512),
+ *      which is instruct-only, so `reasoning_effort` is dropped for it even
+ *      when MISTRAL_REASONING_EFFORT is set.
  */
 
 const axios = require('axios');
@@ -32,6 +38,65 @@ const REPLY_LENGTH_MAX_TOKENS = 4096;
 // transient 5xx rather than failing immediately.
 // 4xx client errors (400, 401, 403, 404…) fail every time, so they are not retried.
 const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 499, 500, 502, 503, 504]);
+
+// What each model family accepts, so the request body stays valid for the
+// configured model. Mistral validates the body per model and answers 422 for
+// parameters the model does not support — that is not a retryable status, so a
+// single bad field fails every call until the config is fixed.
+//
+//   reasoningEfforts — the reasoning_effort values the model accepts, or
+//                      `false` when the model has no adjustable reasoning at
+//                      all (Mistral answers 422 if the field is present).
+//   maxOutputTokens  — the published per-reply output cap, when there is one;
+//                      a larger max_tokens is rejected instead of truncated.
+//
+// A model that matches nothing here (a custom backend, a brand-new release) is
+// sent untouched: guessing its limits is worse than the old pass-through, and
+// MISTRAL_API_URL may point at a server that is not Mistral at all.
+const MODEL_CAPABILITIES = [
+  // Mistral Large 3 — the default. Released 2025-12-02, deprecated by Mistral
+  // on 2026-10-31 and retired 2027-04-29 (successor: mistral-large-4). It is
+  // an instruct-only model: no thinking phase, no reasoning_effort parameter.
+  // 256k context, 8k output.
+  {
+    pattern: /^mistral-large-(?:2512|3(?:-[\d-]+)?)$/,
+    reasoningEfforts: false,
+    maxOutputTokens: 8192
+  },
+  // Pinned older Large snapshots: also instruct-only with an 8k output cap.
+  {
+    pattern: /^mistral-large-(?:2411|2407|2402)$/,
+    reasoningEfforts: false,
+    maxOutputTokens: 8192
+  },
+  // Small/edge (Ministral 3), code (Codestral, Devstral) and audio (Voxtral)
+  // models are instruct-only as well.
+  { pattern: /^(?:ministral|codestral|devstral|voxtral)-/, reasoningEfforts: false },
+  { pattern: /^open-(?:mistral|mixtral)/, reasoningEfforts: false },
+  // Magistral reasons natively: it does not take the parameter at all.
+  { pattern: /^magistral-/, reasoningEfforts: false },
+  // Reasoning-capable models, with the values Mistral documents for each.
+  // Mistral Large 4 takes low/medium/high — no `none`.
+  { pattern: /^mistral-large-(?:4(?:-[\d-]+)?|latest)$/, reasoningEfforts: ['low', 'medium', 'high'] },
+  { pattern: /^mistral-medium-(?:3-5|4(?:-[\d-]+)?)$/, reasoningEfforts: ['none', 'high'] },
+  { pattern: /^mistral-small-(?:2603|4(?:-[\d-]+)?)$/, reasoningEfforts: ['none', 'high'] },
+  { pattern: /^zai-glm-/, reasoningEfforts: ['low', 'high', 'max'] }
+];
+
+// Returns { model, reasoningEfforts, maxOutputTokens } for a model id.
+// `reasoningEfforts` is `false` (parameter not accepted), an array of accepted
+// values, or `undefined` when the model is unknown — in which case anything the
+// operator configured is sent as-is.
+function modelCapabilities(model) {
+  const id = String(model == null ? '' : model).trim().toLowerCase();
+  const entry = MODEL_CAPABILITIES.find(candidate => candidate.pattern.test(id));
+  if (!entry) return { model: id, reasoningEfforts: undefined, maxOutputTokens: undefined };
+  return {
+    model: id,
+    reasoningEfforts: Array.isArray(entry.reasoningEfforts) ? [...entry.reasoningEfforts] : entry.reasoningEfforts,
+    maxOutputTokens: entry.maxOutputTokens
+  };
+}
 
 function toPositiveInt(value, fallback) {
   const n = parseInt(value, 10);
@@ -162,7 +227,8 @@ function describeMistralError(error) {
 
 // Normalizes a reasoning_effort override. Mistral reasoning models accept
 // "none" / "high" (some accept "low" / "max"); every other model rejects the
-// parameter outright with HTTP 400, so it is only ever sent when configured.
+// parameter outright with HTTP 422, so it is only ever sent when configured —
+// and only to a model that accepts it (see MODEL_CAPABILITIES).
 function toReasoningEffort(value) {
   const effort = value == null ? '' : String(value).trim().toLowerCase();
   return effort || undefined;
@@ -178,26 +244,71 @@ function createMistralClient(options = {}) {
   const maxRetries = toNonNegativeInt(options.maxRetries ?? process.env.MISTRAL_MAX_RETRIES, 3);
   const baseDelayMs = toPositiveInt(options.baseDelayMs, 800);
   const maxDelayMs = toPositiveInt(options.maxDelayMs, 10000);
-  // Set MISTRAL_REASONING_EFFORT=none to make reasoning models (magistral-*,
-  // mistral-medium-3-5, mistral-small-2603) skip the thinking phase — without
-  // it they can burn the whole token budget (and seconds of wall-clock time)
-  // on reasoning before answering. Leave unset for models that reject the
-  // parameter (mistral-large-latest, codestral, ministral-*): they 400 on it.
+  // Set MISTRAL_REASONING_EFFORT=none to make reasoning models (mistral-small-4,
+  // mistral-medium-3-5, mistral-large-4) skip the thinking phase — without it
+  // they can burn the whole token budget (and seconds of wall-clock time) on
+  // reasoning before answering. It is only sent to models that accept it: the
+  // default mistral-large-2512 (Mistral Large 3) is instruct-only and answers
+  // 422 when the field is present, so the knob is ignored (with a warning) there.
   const reasoningEffort = toReasoningEffort(options.reasoningEffort ?? process.env.MISTRAL_REASONING_EFFORT);
   const logger = options.logger || console;
+  const capabilities = modelCapabilities(model);
+
+  // One warning per distinct problem, so a per-turn call does not flood the logs.
+  const warned = new Set();
+  function warnOnce(key, message) {
+    if (warned.has(key)) return;
+    warned.add(key);
+    if (typeof logger.warn === 'function') logger.warn(message);
+  }
+
+  // Drops a reasoning_effort the target model would reject. Unknown models get
+  // whatever the operator configured, exactly as before.
+  function resolveReasoningEffort(value) {
+    const effort = toReasoningEffort(value);
+    if (!effort) return undefined;
+    const allowed = capabilities.reasoningEfforts;
+    if (allowed === undefined) return effort;
+    if (Array.isArray(allowed) && allowed.includes(effort)) return effort;
+    warnOnce(
+      'reasoning_effort',
+      `Ignoring reasoning_effort="${effort}" for model ${model}: ` +
+      (allowed === false
+        ? 'this model does not accept reasoning_effort (Mistral answers 422). Remove MISTRAL_REASONING_EFFORT or pick a reasoning model.'
+        : `accepted values are ${allowed.join(', ')}.`)
+    );
+    return undefined;
+  }
+
+  // Keeps max_tokens inside the model's published output cap. Mistral rejects a
+  // larger value instead of truncating, and the reply-length escalation below
+  // must never push past the cap either.
+  function capMaxTokens(value) {
+    const limit = capabilities.maxOutputTokens;
+    if (!limit || !Number.isFinite(value) || value <= limit) return value;
+    warnOnce(
+      `max_tokens:${limit}`,
+      `Capping max_tokens ${value} to ${limit} for model ${model} (published per-reply output limit).`
+    );
+    return limit;
+  }
+
+  const configuredReasoningEffort = resolveReasoningEffort(reasoningEffort);
 
   // Returns the assistant's reply text. Throws the original (sanitized-with
   // describeMistralError before logging!) error after all retries are spent.
   async function chat(messages, overrides = {}) {
-    const requestedMaxTokens = overrides.max_tokens ?? DEFAULT_MAX_TOKENS;
+    const requestedMaxTokens = capMaxTokens(overrides.max_tokens ?? DEFAULT_MAX_TOKENS);
     // Reasoning models can burn the whole default token budget on thinking
     // chunks; when a reply is cut short by the limit we grow the budget on
     // retries instead of re-sending the same token-starved request.
-    const lengthCap = Math.max(REPLY_LENGTH_MAX_TOKENS, requestedMaxTokens);
+    const lengthCap = capMaxTokens(Math.max(REPLY_LENGTH_MAX_TOKENS, requestedMaxTokens));
     let effectiveMaxTokens = requestedMaxTokens;
     const temperature = overrides.temperature ?? 0.8;
     const requestTimeoutMs = toPositiveInt(overrides.timeoutMs, timeoutMs);
-    const effectiveReasoningEffort = toReasoningEffort(overrides.reasoningEffort) ?? reasoningEffort;
+    const effectiveReasoningEffort = overrides.reasoningEffort !== undefined
+      ? resolveReasoningEffort(overrides.reasoningEffort)
+      : configuredReasoningEffort;
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       const body = {
@@ -233,19 +344,23 @@ function createMistralClient(options = {}) {
         // for reasoning models), grow max_tokens for the next attempt;
         // re-sending the same budget would fail the same way.
         if (error.isMistralReplyError && error.details && error.details.finishReason === 'length') {
-          effectiveMaxTokens = Math.min(lengthCap, Math.max(effectiveMaxTokens * 4, 1024));
+          effectiveMaxTokens = capMaxTokens(Math.min(lengthCap, Math.max(effectiveMaxTokens * 4, 1024)));
         }
 
         // Exponential backoff with jitter: ~0.8s, ~1.6s, ~3.2s… capped at maxDelayMs.
         const backoff = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
         const delay = backoff + Math.floor(Math.random() * Math.max(1, baseDelayMs / 4));
         const thinkingHint = error.isMistralReplyError && error.details && error.details.thinkingOnly && !effectiveReasoningEffort
-          ? ' Hint: the model spent the budget on thinking — set MISTRAL_REASONING_EFFORT=none to disable reasoning on reasoning models.'
+          ? (capabilities.reasoningEfforts === false
+            ? ' Hint: the model spent the reply budget on thinking, but this model does not accept reasoning_effort — raise max_tokens or switch to a reasoning model.'
+            : ' Hint: the model spent the budget on thinking — set MISTRAL_REASONING_EFFORT=none to disable reasoning on reasoning models.')
           : '';
-        logger.warn(
-          `Mistral API attempt ${attempt + 1} of ${maxRetries + 1} failed ` +
-          `(${describeMistralError(error)}); retrying in ${delay}ms${thinkingHint}`
-        );
+        if (typeof logger.warn === 'function') {
+          logger.warn(
+            `Mistral API attempt ${attempt + 1} of ${maxRetries + 1} failed ` +
+            `(${describeMistralError(error)}); retrying in ${delay}ms${thinkingHint}`
+          );
+        }
         await sleep(delay);
       }
     }
@@ -254,7 +369,7 @@ function createMistralClient(options = {}) {
     throw new Error('Mistral API call failed');
   }
 
-  return { chat, url, model, timeoutMs, maxRetries };
+  return { chat, url, model, timeoutMs, maxRetries, capabilities };
 }
 
 module.exports = {
@@ -262,6 +377,8 @@ module.exports = {
   describeMistralError,
   isRetryableMistralError,
   extractMessageText,
+  modelCapabilities,
+  MODEL_CAPABILITIES,
   RETRYABLE_STATUSES,
   DEFAULT_URL,
   DEFAULT_MODEL

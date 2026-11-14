@@ -23,6 +23,8 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const Module = require('module');
 
+const { DEFAULT_MODEL } = require('../mistralClient');
+
 const PORT = 18991;
 const API_KEY = 'route-test-key';
 
@@ -585,7 +587,7 @@ test('POST /wrestling_chat success contract is unchanged', async () => {
   const payload = mistralRequests[mistralRequests.length - 1].body;
   assert.equal(payload.max_tokens, 250);
   assert.equal(payload.temperature, 0.8);
-  assert.equal(payload.model, 'mistral-large-latest');
+  assert.equal(payload.model, DEFAULT_MODEL, 'chat uses the configured Mistral model');
   assert.ok(mistralRequests.length > before);
 });
 
